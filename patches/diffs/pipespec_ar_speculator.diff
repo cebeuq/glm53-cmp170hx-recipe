@@ -1,0 +1,126 @@
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -10,6 +10,7 @@
+ from vllm.forward_context import BatchDescriptor, set_forward_context
+ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
++from vllm.v1 import cmp_pipespec as _cmp_ps
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+ from vllm.v1.worker.gpu.block_table import BlockTables
+@@ -46,6 +47,26 @@
+         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+         self.use_fused_multi_step_decode = False
++
++        # PipeSpec: one propose drafts k tokens (returned, as usual) and
++        # can continue the same chain for num_p2 more (`continue_chain`), which
++        # PipeSpec verifies in the next epoch's chunk B. The decode-step kernel
++        # must therefore keep updating the chain inputs past step k-1.
++        self.num_p2 = 0
++        if (
++            _cmp_ps.ENABLED
++            and self.num_speculative_steps == _cmp_ps.SUPPORTED_K
++            and self.draft_logits is None
++        ):
++            self.num_p2 = _cmp_ps.num_p2(self.num_speculative_steps)
++            self.draft_tokens = torch.zeros(
++                self.max_num_reqs,
++                self.num_speculative_steps + self.num_p2,
++                dtype=torch.int64,
++                device=device,
++            )
++        self.num_chain_steps = self.num_speculative_steps + self.num_p2
++        self._chain_ctx: tuple | None = None
+ 
+     def load_model(self, target_model: nn.Module) -> None:
+         super().load_model(target_model)
+@@ -234,8 +255,9 @@
+         max_query_len = input_batch.num_scheduled_tokens.max()
+         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+         self.draft_max_seq_len = min(
+-            max_seq_len + self.num_speculative_steps, self.max_model_len
++            max_seq_len + self.num_chain_steps, self.max_model_len
+         )
++        self._chain_ctx = None
+ 
+         # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
+         # number of rejected tokens, we maintain the size of input_ids and
+@@ -323,6 +345,7 @@
+         if self.num_speculative_steps == 1:
+             # Early exit.
+             return self.draft_tokens[:num_reqs, :1]
++        k = self.num_speculative_steps
+ 
+         # Prepare the inputs for the decode steps.
+         prepare_decode_inputs(
+@@ -375,7 +398,35 @@
+         )
+         self.on_multi_step_decode_end(num_reqs)
+ 
+-        return self.draft_tokens[:num_reqs]
++        if self.num_p2 and not dummy_run and not self.use_fused_multi_step_decode:
++            self._chain_ctx = (
++                num_reqs,
++                decode_batch_desc,
++                num_tokens_across_dp,
++                input_batch.seq_lens_cpu_upper_bound,
++            )
++        return self.draft_tokens[:num_reqs, :k]
++
++    @torch.inference_mode()
++    def continue_chain(self) -> torch.Tensor:
++        """PipeSpec: continue the last propose()'s draft chain by num_p2
++        steps (same decode graph, steps k..k+num_p2-1). Returns the new drafts
++        [num_reqs, num_p2]. Must directly follow propose() on the main stream."""
++        assert self._chain_ctx is not None, "continue_chain without propose"
++        num_reqs, batch_desc, num_tokens_across_dp, seq_lens_ub = self._chain_ctx
++        self._chain_ctx = None
++        k = self.num_speculative_steps
++        self.on_multi_step_decode_begin(num_reqs)
++        self._multi_step_decode(
++            num_reqs,
++            False,
++            batch_desc,
++            num_tokens_across_dp,
++            seq_lens_ub,
++            steps=range(k, self.num_chain_steps),
++        )
++        self.on_multi_step_decode_end(num_reqs)
++        return self.draft_tokens[:num_reqs, k : self.num_chain_steps]
+ 
+     @torch.inference_mode()
+     def _run_model(
+@@ -499,6 +550,7 @@
+         batch_desc: BatchExecutionDescriptor,
+         num_tokens_across_dp: torch.Tensor | None,
+         seq_lens_cpu_upper_bound: torch.Tensor,
++        steps: range | None = None,
+     ) -> None:
+         positions = self.input_buffers.positions[:num_reqs]
+         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
+@@ -506,10 +558,12 @@
+ 
+         attn_metadata = None
+         slot_mappings_by_layer = None
+-        for step in range(1, self.num_speculative_steps):
++        if steps is None:
++            steps = range(1, self.num_speculative_steps)
++        for step in steps:
+             # Rebuild every step when positions advance, or just once
+             # on the first step when positions are constant (Gemma4 MTP).
+-            if not skip_attn and (self.advance_draft_positions or step == 1):
++            if not skip_attn and (self.advance_draft_positions or step == steps[0]):
+                 slot_mappings = self.block_tables.compute_slot_mappings(
+                     idx_mapping,
+                     query_start_loc,
+@@ -678,7 +732,8 @@
+             self.sample_src_positions,
+             num_reqs,
+             self.max_model_len,
+-            self.num_speculative_steps,
++            # PipeSpec: keep updating chain inputs past step k-1.
++            self.num_chain_steps,
+             advance_draft_positions=self.advance_draft_positions,
+         )
+         self._fence_draft_inputs()

@@ -1,0 +1,21 @@
+--- a/vllm/distributed/device_communicators/custom_all_reduce.py
++++ b/vllm/distributed/device_communicators/custom_all_reduce.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ from contextlib import contextmanager
+ from typing import cast
+ 
+@@ -233,6 +234,10 @@
+             physical_device_ids = [t.item() for t in gather_list]
+             assert current_platform.is_cuda_alike()
+             fully_connected = current_platform.is_fully_connected(physical_device_ids)
++            # recipe: PCIe-only CMP 170HX with verified P2P (docs/p2p.md). Treat a TP group
++            # inside one PLX switch as fully connected so TP>2 can use the custom kernels.
++            if not fully_connected and os.environ.get("CMP_PCIE_CUSTOM_AR", "0") == "1":
++                fully_connected = True
+         if same_node and world_size > 2 and not fully_connected:
+             logger.warning(
+                 "Custom allreduce is disabled because it's not supported on"

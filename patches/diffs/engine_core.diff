@@ -1,0 +1,25 @@
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -599,8 +599,20 @@
+ 
+     def _should_throttle_prefills(self) -> bool:
+         """Whether to defer new prefills this step (DP prefill balancing).
+-        Overridden by the DP engine core; never throttles otherwise."""
+-        return False
++        Overridden by the DP engine core; never throttles otherwise.
++
++        recipe patch (2026-10-09): with CMP_PREFILL_INFLIGHT_CAP=N, throttle once N
++        in-flight PP batches already carry prefill work, so a long chunked prefill keeps
++        at most N pipeline stages computing at once (single-circuit PSU wall-power limit).
++        Decode-only batches are never limited, preserving the PP ring cadence."""
++        cap = int(os.environ.get("CMP_PREFILL_INFLIGHT_CAP", "0") or 0)
++        if cap <= 0 or not self.batch_queue:
++            return False
++        inflight = 0
++        for _, scheduler_output, _ in self.batch_queue:
++            if any(n > 8 for n in scheduler_output.num_scheduled_tokens.values()):
++                inflight += 1
++        return inflight >= cap
+ 
+     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+         """Schedule, execute, and make output.

@@ -1,0 +1,74 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -609,6 +610,21 @@
+         defer_prefills = (
+             throttle_prefills and not self.prefill_capacity_bound
+         ) and any(not r.is_prefill_chunk for r in self.running)
++        # recipe patch (2026-10-09): the power-cap throttle (CMP_PREFILL_INFLIGHT_CAP,
++        # engine core) defers prefill unconditionally; a lone long prefill must be capped too.
++        if throttle_prefills and os.environ.get("CMP_PREFILL_INFLIGHT_CAP"):
++            defer_prefills = True
++        # recipe patch (2026-10-10): fair chunked prefill (port of the Flash recipe's
++        # prefill_chunk_with_decodes / FAIR_CHUNK). While any running request is decoding,
++        # cap the total PREFILL tokens per step at CMP_FAIR_CHUNK so a long prompt can't
++        # stall other sessions' decode; decode tokens are not capped. Off when unset/0, and a
++        # prompt arriving into an idle engine (nothing decoding) keeps the full chunk budget.
++        _cmp_fair_cap = int(os.environ.get("CMP_FAIR_CHUNK", "0") or 0)
++        fair_prefill_left = (
++            _cmp_fair_cap
++            if _cmp_fair_cap > 0 and any(not r.is_prefill_chunk for r in self.running)
++            else None
++        )
+ 
+         # First, schedule the RUNNING requests.
+         req_index = 0
+@@ -663,6 +679,11 @@
+             )
+             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
++            if fair_prefill_left is not None and request.is_prefill_chunk:
++                if fair_prefill_left <= 0:
++                    req_index += 1
++                    continue
++                num_new_tokens = min(num_new_tokens, fair_prefill_left)
+             num_new_tokens = min(
+                 num_new_tokens, token_budget, input_budget - draft_slots
+             )
+@@ -795,6 +816,8 @@
+             # Schedule the request.
+             scheduled_running_reqs.append(request)
+             prefill_scheduled |= request.is_prefill_chunk
++            if fair_prefill_left is not None and request.is_prefill_chunk:
++                fair_prefill_left -= num_new_tokens
+             request_id = request.request_id
+             req_to_new_blocks[request_id] = new_blocks
+             num_scheduled_tokens[request_id] = num_new_tokens
+@@ -1060,6 +1083,11 @@
+                     threshold = self.scheduler_config.long_prefill_token_threshold
+                     if 0 < threshold < num_new_tokens:
+                         num_new_tokens = threshold
++                    if fair_prefill_left is not None:
++                        # fair chunked prefill: waiting requests are prefills.
++                        if fair_prefill_left <= 0:
++                            break
++                        num_new_tokens = min(num_new_tokens, fair_prefill_left)
+ 
+                     # chunked prefill has to be enabled explicitly to allow
+                     # pooling requests to be chunked
+@@ -1258,6 +1286,8 @@
+                 )
+                 num_scheduled_tokens[request_id] = num_new_tokens
+                 token_budget -= num_new_tokens
++                if fair_prefill_left is not None:
++                    fair_prefill_left -= num_new_tokens
+                 input_budget -= num_new_tokens + draft_slots
+                 request.status = RequestStatus.RUNNING
+                 request.num_computed_tokens = num_computed_tokens

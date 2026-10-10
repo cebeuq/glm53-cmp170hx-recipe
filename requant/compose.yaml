@@ -1,0 +1,37 @@
+# Offline checkpoint conversion, CPU only. Two one-shot steps (requant/README.md):
+#   SRC=/path/nvfp4 RQ=/path/step1 docker compose -f requant/compose.yaml run --rm requant
+#   SRC=/path/nvfp4 RQ=/path/step1 DST=/path/hybrid docker compose -f requant/compose.yaml run --rm hybrid
+# Tune WORKERS / CPUS / MEM to the machine. Do not run this on the GPU server while it serves:
+# a CPU-heavy job next to GPU load can push wall power over a PSU limit.
+name: glm53-requant
+x-common: &common
+  build: .
+  image: glm53-recipe/requant:1
+  restart: "no"
+  user: "${UID_GID:-1000:1000}"
+  read_only: true
+  network_mode: none
+  tmpfs: ["/tmp:size=2g"]
+  environment:
+    OMP_NUM_THREADS: "1"
+  cpus: ${CPUS:-8}
+  cpu_shares: 128
+  mem_limit: ${MEM:-40g}
+  pids_limit: ${PIDS:-512}
+  logging: { driver: local, options: { max-size: "20m", max-file: "3" } }
+services:
+  # Step 1: NVFP4 checkpoint -> INT4-g128 experts + INT8-g128 residue (RTN, no calibration).
+  requant:
+    <<: *common
+    volumes:
+      - ${SRC:?set SRC to the NVFP4 checkpoint}:/in:ro
+      - ${RQ:?set RQ to the step-1 output dir}:/out
+    command: ["/work/requant_full.py", "/in", "/out", "--workers", "${WORKERS:-8}"]
+  # Step 2: keep step 1's INT8 residue, put the original NVFP4 experts back (bytes unchanged).
+  hybrid:
+    <<: *common
+    volumes:
+      - ${SRC:?set SRC to the NVFP4 checkpoint}:/in:ro
+      - ${RQ:?set RQ to the step-1 output dir}:/rq:ro
+      - ${DST:?set DST to the hybrid output dir}:/out
+    command: ["/work/hybrid_nvfp4e_int8r.py", "/in", "/rq", "/out", "--workers", "${WORKERS:-8}"]

@@ -1,0 +1,35 @@
+# P2P module build: one-shot, driven by build.sh (which sets KVER / HDR_DIR / HDR_COMMON_DIR / DRIVER_VERSION).
+#   modbuild : compiles the patched NVIDIA kernel modules into ./out (no network, no GPUs)
+# CMPUNLOCKER_DIR: a cmpunlocker tree that contains the TRAP31 p2p-unlock.patch (docs/p2p.md).
+# The test tools are a separate project: tests/compose.yaml
+name: glm53-p2p
+services:
+  modbuild:
+    build: { context: ., dockerfile: Dockerfile }
+    image: glm53-recipe/p2p-modbuild:1
+    restart: "no"
+    network_mode: none
+    user: "${UID_GID:-1000:1000}"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /build:size=10g,exec,mode=1777
+    environment:
+      KVER: ${KVER:?}
+      SYSSRC: ${HDR_DIR:?}
+      DRIVER_VERSION: ${DRIVER_VERSION:?}
+      PROFILE: ${PROFILE:-8gb}
+      JOBS: ${JOBS:-8}
+      PREP_ONLY: ${PREP_ONLY:-0}
+      ALLOW_BAR1_RESIZE: ${ALLOW_BAR1_RESIZE:-0}
+    volumes:
+      - ${CMPUNLOCKER_DIR:?set CMPUNLOCKER_DIR}:/src/cmpunlocker:ro
+      - ./cache:/cache:ro
+      - ./out:/out
+      - ${HDR_DIR:?}:${HDR_DIR:?}:ro
+      - ${HDR_COMMON_DIR:?}:${HDR_COMMON_DIR:?}:ro
+    cpus: ${JOBS:-8}
+    cpuset: "${CPUSET:-}"
+    mem_limit: 16g
+    pids_limit: 4096
+    logging: { driver: local, options: { max-size: "20m", max-file: "3" } }

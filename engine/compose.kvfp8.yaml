@@ -1,0 +1,7 @@
+# Overlay: 8-bit latent KV cache read path for TRITON_MLA_SPARSE on sm_80 (docs/kv-cache.md).
+# Use with KV_DTYPE=fp8_ds_mla (or fp8) in the vars file. The base compose already mounts the
+# matching xpu_mla_sparse.py backend file; BF16 runs are unaffected by this overlay.
+services:
+  vllm:
+    volumes:
+      - ../patches/vllm/kvfp8_sparse_mla.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/kvfp8_sparse_mla.py:ro

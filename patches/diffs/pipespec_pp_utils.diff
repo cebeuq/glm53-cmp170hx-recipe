@@ -1,0 +1,202 @@
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -1,7 +1,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Pipeline Parallelism utils for V2 Model Runner."""
++"""Pipeline Parallelism utils for V2 Model Runner.
+ 
++PipeSpec (CMP_PIPESPEC=1, vllm/v1/cmp_pipespec.py): per-step message
++formats N/A/B, early consumption of a chunk-B slot together with its chunk-A
++slot, and the P2 draft stash that feeds the next chunk B on the first rank.
++"""
++
+ from collections import deque
+ from dataclasses import dataclass
+ 
+@@ -32,8 +37,17 @@
+     # detect requests aborted since then.
+     gen_at_receive_np: np.ndarray  # [num_reqs]
+     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
++    # PipeSpec: message format of this step ("N", "A" or "B"); for "B",
++    # draft_tokens holds P1 and p2_tokens/event2 the chunk-B drafts (k+1).
++    fmt: str = "N"
++    p2_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps + 1]
++    event2: torch.cuda.Event | None = None
+ 
+ 
++# PipeSpec: queue entry of a chunk-B slot already consumed with its A slot.
++_CONSUMED = object()
++
++
+ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+     """Return a bool array of shape `[input_batch.num_reqs]` marking requests
+     that produce a sampled token this step, and therefore must have that token
+@@ -86,6 +100,10 @@
+             group_desc="pp_broadcast"
+         )
+         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
++        # PipeSpec: req_idx -> (p2 [k+1] tensor, event); set while
++        # consuming a chunk-B slot, valid only for the step right after.
++        self.p2_stash: dict[int, tuple[torch.Tensor, torch.cuda.Event]] = {}
++        self.p2_stash_prev: dict[int, tuple[torch.Tensor, torch.cuda.Event]] = {}
+ 
+     def on_req_idx_freed(self, req_idx: int) -> None:
+         self.req_idx_gen_np[req_idx] += 1
+@@ -118,15 +136,65 @@
+     ) -> dict[str, torch.Tensor] | None:
+         """Consume the entry from pp_size steps ago and wait for its recv event,
+         then filter out entries whose request was freed since `receive`.
++
++        PipeSpec: if that entry is a chunk-A slot and the next entry is
++        its chunk-B slot, the B slot is claimed too; the caller must then call
++        `take_chunk_b_outputs` and post-process it right after this one.
+         """
++        # P2 drafts stashed during the previous step are usable in this step only.
++        self.p2_stash_prev = self.p2_stash
++        self.p2_stash = {}
++        self._chunk_b_slot = None
+         if not self.queue:
+             return None
+         slot = self.queue.popleft()
+         # Reserve this step's slot; `receive` overwrites it if applicable.
+         self.queue.append(None)
++        if slot is None or slot is _CONSUMED:
++            return None
++        if (
++            slot.fmt == "A"
++            and self.queue
++            and isinstance(self.queue[0], PendingRecv)
++            and self.queue[0].fmt == "B"
++            and np.array_equal(self.queue[0].idx_mapping_np, slot.idx_mapping_np)
++        ):
++            self._chunk_b_slot = self.queue[0]
++            self.queue[0] = _CONSUMED
++        return self._consume_slot(slot, draft_tokens_to_update)
++
++    def take_chunk_b_outputs(
++        self, draft_tokens_to_update: torch.Tensor | None = None
++    ) -> dict[str, torch.Tensor] | None:
++        """PipeSpec: outputs of the chunk-B slot claimed by the last
++        `get_prev_sampled_outputs` (P1 drafts -> draft_tokens_to_update), and
++        stash its P2 drafts for the chunk B of the current epoch."""
++        slot = self._chunk_b_slot
++        self._chunk_b_slot = None
+         if slot is None:
+             return None
++        out = self._consume_slot(slot, draft_tokens_to_update)
++        if out is not None and slot.p2_tokens is not None:
++            freed = self.req_idx_gen_np[slot.idx_mapping_np] != slot.gen_at_receive_np
++            for row, req_idx in enumerate(slot.idx_mapping_np):
++                if not freed[row] and slot.need_sampled_mask[row]:
++                    assert slot.event2 is not None
++                    self.p2_stash[int(req_idx)] = (slot.p2_tokens[row], slot.event2)
++        return out
+ 
++    def take_p2_for_chunk_b(self, req_idx: int) -> torch.Tensor | None:
++        """PipeSpec: P2 drafts for request `req_idx`'s chunk B in this
++        step, after making the main stream wait for their arrival."""
++        entry = self.p2_stash_prev.pop(req_idx, None)
++        if entry is None:
++            return None
++        p2, event = entry
++        self.main_stream.wait_event(event)
++        return p2
++
++    def _consume_slot(
++        self, slot: PendingRecv, draft_tokens_to_update: torch.Tensor | None
++    ) -> dict[str, torch.Tensor] | None:
+         # Skip requests which did not need sampled output and/or those already
+         # finished. The post_update kernel skips the -1 entries.
+         freed = self.req_idx_gen_np[slot.idx_mapping_np] != slot.gen_at_receive_np
+@@ -160,6 +228,35 @@
+             idx_mapping=idx_mapping,
+         )
+ 
++    def broadcast_rows(self, rows: torch.Tensor, ready: torch.cuda.Event) -> None:
++        """PipeSpec: broadcast `rows` ([num_reqs, n] int64, produced on the
++        main stream before `ready`) without waiting for later main-stream work."""
++        assert self.is_last_rank
++        assert rows.dtype == torch.int64
++        with torch.cuda.stream(self.broadcast_stream):
++            self.broadcast_stream.wait_event(ready)
++            rows.record_stream(self.broadcast_stream)
++            torch.distributed.broadcast(
++                rows, src=self.last_rank, group=self.broadcast_group
++            )
++
++    def broadcast_dropped_chunk(self, num_reqs: int) -> None:
++        """PipeSpec: sampled/counts message of a dropped chunk B
++        (num_sampled 0, num_rejected k+1). Depends on no GPU work."""
++        assert self.is_last_rank
++        with torch.cuda.stream(self.broadcast_stream):
++            send_tokens = torch.zeros(
++                num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
++            )
++            combined = torch.zeros(2, num_reqs, dtype=torch.int32, device=self.device)
++            combined[1].fill_(self.max_sample_len)
++            torch.distributed.broadcast(
++                send_tokens, src=self.last_rank, group=self.broadcast_group
++            )
++            torch.distributed.broadcast(
++                combined, src=self.last_rank, group=self.broadcast_group
++            )
++
+     def broadcast_drafts(
+         self, draft_tokens: torch.Tensor, input_batch: InputBatch
+     ) -> None:
+@@ -177,9 +274,12 @@
+                 send, src=self.last_rank, group=self.broadcast_group
+             )
+ 
+-    def receive(self, input_batch: InputBatch) -> bool:
++    def receive(self, input_batch: InputBatch, fmt: str = "N") -> bool:
+         """Returns True iff sampled tokens need to be gathered from *all*
+-        requests in the batch."""
++        requests in the batch.
++
++        PipeSpec: fmt "A" receives no drafts; fmt "B" receives P1 (k
++        drafts, covered by `event`) and P2 (k+1 drafts, covered by `event2`)."""
+         assert not self.is_last_rank
+         need_sampled_mask = compute_need_sampled_mask(input_batch)
+         if need_sampled_mask is None:
+@@ -204,7 +304,7 @@
+                 combined, src=self.last_rank, group=self.broadcast_group
+             )
+             draft_tokens = None
+-            if self.num_speculative_steps > 0:
++            if self.num_speculative_steps > 0 and fmt != "A":
+                 draft_tokens = torch.empty(
+                     num_reqs,
+                     self.num_speculative_steps,
+@@ -215,6 +315,20 @@
+                     draft_tokens, src=self.last_rank, group=self.broadcast_group
+                 )
+             event = self.broadcast_stream.record_event()
++            p2_tokens = None
++            event2 = None
++            if fmt == "B":
++                p2_tokens = torch.empty(
++                    num_reqs,
++                    self.num_speculative_steps + 1,
++                    dtype=torch.int64,
++                    device=self.device,
++                )
++                torch.distributed.broadcast(
++                    p2_tokens, src=self.last_rank, group=self.broadcast_group
++                )
++                event2 = self.broadcast_stream.record_event()
++                p2_tokens.record_stream(self.main_stream)
+             num_sampled, num_rejected = combined.unbind(dim=0)
+             # Must record_stream since these were allocated on broadcast stream but
+             # later used on the main stream.
+@@ -232,6 +346,9 @@
+             need_sampled_mask,
+             gen_at_receive_np,
+             draft_tokens,
++            fmt,
++            p2_tokens,
++            event2,
+         )
+         return bool(need_sampled_mask.all())
+ 

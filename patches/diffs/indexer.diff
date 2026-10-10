@@ -1,0 +1,23 @@
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -3,6 +3,8 @@
+ from dataclasses import dataclass
+ from typing import Any, NamedTuple
+ 
++import os
++
+ import torch
+ 
+ import vllm.envs as envs
+@@ -833,7 +835,10 @@
+     # within the flashmla_sparse workspace.
+     # For DeepSeek-V3.2, the max_model_len is 163840.
+     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
+-    return max_model_len * 40
++    # recipe patch (2026-10-09): the x40 factor only batches many prefills into one K gather
++    # (_split_indexer_prefill_chunks splits at this bound). At 512K it costs ~2.6 GiB/rank of
++    # KV headroom; a smaller factor just splits multi-request prefills into more chunks.
++    return max_model_len * int(os.environ.get("CMP_INDEXER_PREFILL_BUF_FACTOR", "40"))
+ 
+ 
+ def _supports_varlen_paged_mqa_logits() -> bool:

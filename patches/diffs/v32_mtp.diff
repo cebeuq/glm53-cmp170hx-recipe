@@ -1,0 +1,20 @@
+--- a/vllm/models/deepseek_v32/nvidia/mtp.py
++++ b/vllm/models/deepseek_v32/nvidia/mtp.py
+@@ -366,6 +366,17 @@
+         for name, loaded_weight in weights:
+             if "rotary_emb.inv_freq" in name:
+                 continue
++            # recipe: GLM-5.x stores embed_tokens only at top level (no layer-78 copy).
++            # Under PP the target's embed is a PPMissingLayer on the last stage and
++            # maybe_share_target_embed() returns early, so load our own copy here
++            # (same fix as model_executor/models/deepseek_mtp.py). Without it the
++            # drafter embeds with an unloaded table (~20% acceptance vs 85% on TP8).
++            if name == "model.embed_tokens.weight" and (
++                param := params_dict.get(name)
++            ) is not None:
++                getattr(param, "weight_loader", default_weight_loader)(param, loaded_weight)
++                loaded_params.add(name)
++                continue
+             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+             if spec_layer is None:
+                 continue

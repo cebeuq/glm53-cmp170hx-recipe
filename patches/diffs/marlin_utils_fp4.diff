@@ -1,0 +1,104 @@
+--- a/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
++++ b/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
+@@ -41,20 +41,29 @@
+ ) -> float:
+     """Compute the power-of-2 scale_factor needed so that all non-zero
+     values in marlin_scales * 2^7 are >= 2 after rescaling.
+-    Returns a Python float (power of 2, >= 1.0)."""
++    Returns a Python float (power of 2, >= 1.0).
+ 
++    recipe patch (2026-09-01): computed in bounded chunks. The upstream
++    whole-tensor float()/mask/gather needed a multi-GiB transient that OOMs
++    64 GB sm80 ranks holding ten NVFP4 MoE layers. Result is identical."""
++
+     # Since half has a smaller dynamic range compared to bfloat16,
+     # no rescaling is applied here if active dtype is half.
+     if a_dtype is not None and a_dtype == torch.half:
+         return 1.0
+ 
+-    ws_float = marlin_scales.float() * (2**7)
+-    nonzero_mask = ws_float > 0
+-    if nonzero_mask.any():
+-        max_val = ws_float[nonzero_mask].max()
+-        if max_val < 448 * (2**7):
+-            sf = (448 * (2**7) / max_val).log2().floor().exp2()
+-            return sf.item()
++    max_val = None
++    flat = marlin_scales.reshape(-1)
++    for chunk in flat.split(1 << 24):  # 16M elems -> 64 MB fp32 transient
++        ws_float = chunk.float() * (2**7)
++        nz = ws_float[ws_float > 0]
++        if nz.numel():
++            m = nz.max()
++            max_val = m if max_val is None else torch.maximum(max_val, m)
++        del ws_float, nz
++    if max_val is not None and max_val < 448 * (2**7):
++        sf = (448 * (2**7) / max_val).log2().floor().exp2()
++        return sf.item()
+     return 1.0
+ 
+ 
+@@ -314,7 +323,12 @@
+     num_experts = weight.shape[0]
+     out: torch.Tensor | None = None
+     for i in range(num_experts):
+-        qweight = weight[i].view(torch.int32).T.contiguous()
++        # recipe patch: weight may be parked on CPU; stream one expert to this
++        # worker's GPU (upstream dropped the `perm` arg the old patch keyed on).
++        qweight = (
++            weight[i].to(f"cuda:{torch.cuda.current_device()}")
++            .view(torch.int32).T.contiguous()
++        )
+         marlin_qweight = ops.gptq_marlin_repack(
+             b_q_weight=qweight,
+             size_k=size_k,
+@@ -355,6 +369,31 @@
+     input_dtype = get_marlin_input_dtype(prefix="")
+     if input_dtype is not None and input_dtype.itemsize == 1:
+         raise RuntimeError("NVFP4 weight + INT8/FP8 activation is not supported.")
++
++    # recipe patch (2026-09-01): park the originals on CPU so a 64 GB sm80
++    # rank holding ten NVFP4 MoE layers does not hold original + repacked +
++    # scale copies simultaneously (allocator measured 0 free on ranks 1-3
++    # with VLLM_PP_LAYER_PARTITION=12,10,10,10,9,9,9,9).
++    _orig_device = w13.device
++
++    def _park(t, attr):
++        if t is None or t.device.type == "cpu":
++            return t
++        cpu = t.detach().to("cpu", copy=True)
++        lp = getattr(layer, attr, None)
++        if lp is not None and lp.data_ptr() == t.data_ptr():
++            lp.data = cpu
++        try:
++            t.data = cpu
++        except Exception:  # noqa: BLE001
++            pass
++        return cpu
++
++    w13 = _park(w13, "w13_weight")
++    w2 = _park(w2, "w2_weight")
++    w13_scale = _park(w13_scale, "w13_weight_scale")
++    w2_scale = _park(w2_scale, "w2_weight_scale")
++    torch.cuda.empty_cache()
+ 
+     GROUP_SIZE = 16
+     E = layer.num_experts
+@@ -387,7 +426,7 @@
+             return x
+         return torch.nn.functional.pad(x, (0, (padded_N - N) // packing))
+ 
+-    device = w13.device
++    device = _orig_device
+     param_dtype = layer.params_dtype
+     is_a_8bit = input_dtype is not None and input_dtype.itemsize == 1
+ 
+@@ -435,7 +474,7 @@
+         combined_scale_factor = _nvfp4_compute_scale_factor(scales, param_dtype)
+ 
+         for i in range(E):
+-            scale = scales[i].T
++            scale = scales[i].to(device).T
+             marlin_scales = marlin_permute_scales(
+                 s=scale,
+                 size_k=size_k,

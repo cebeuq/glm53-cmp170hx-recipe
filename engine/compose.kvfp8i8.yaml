@@ -1,0 +1,10 @@
+# Overlay (after compose.kvfp8.yaml): int8 latent payload inside the fp8_ds_mla layout (same 656 B/token).
+# Swaps the KV writer for kvfp8_dsv32_kernels.py (= dsv32_kernels.py + an int8 option) and turns the
+# option on for writer and reader together; the reader raises at the first forward if they disagree.
+# This is the production KV format ("int8-tile").
+services:
+  vllm:
+    environment:
+      CMP_KV_DSMLA_INT8: "1"
+    volumes:
+      - ../patches/vllm/kvfp8_dsv32_kernels.py:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v32/common/kernels.py:ro

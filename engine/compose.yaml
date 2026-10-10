@@ -1,0 +1,69 @@
+# GLM-5.3 (GlmMoeDsaForCausalLM, ~753B MoE) on 8x NVIDIA CMP 170HX.
+# Engine: lazymio/vllm-backport (sm_80 vLLM fork) pinned by digest, plus this recipe's patches
+# bind-mounted read-only over the image's files (patches/README.md lists every mount).
+#
+# Everything is driven by a vars file passed with --env-file (see prod.vars.example):
+#   MODEL_DIR, SERVED_MODEL_NAME, TP, PP, CG_MODE, MAX_LEN, UTIL, MAX_SEQS, MAX_BATCHED,
+#   KV_DTYPE, ENV_FILE, EXTRA_ARGS, DISABLE_CAR, PORT, COMPOSE_FILE (overlay chain).
+# DISABLE_CAR defaults to --disable-custom-all-reduce; set it empty (DISABLE_CAR=) to use
+# vLLM's custom all-reduce, which needs working GPU peer-to-peer (docs/p2p.md).
+name: glm53
+services:
+  vllm:
+    image: lazymio/vllm-backport@sha256:2627d2a97e7f539b99ac98f511c589f5f520d3fc5630b195aca7f6ef865ead4e
+    container_name: glm53-vllm
+    restart: "no"
+    init: true
+    shm_size: 32g
+    pids_limit: 8192
+    mem_limit: 112g
+    stop_grace_period: 60s
+    env_file: [ "${ENV_FILE:-env/p2p-tp2pp4.env}" ]
+    environment:
+      TRITON_CACHE_DIR: /cache/triton
+      VLLM_CACHE_ROOT: /cache/vllm
+      TORCHINDUCTOR_CACHE_DIR: /cache/inductor
+      FLASHINFER_WORKSPACE_BASE: /cache/flashinfer
+      TILELANG_CACHE_DIR: /cache/tilelang
+      CMP_FAIR_CHUNK: "${CMP_FAIR_CHUNK:-0}"   # experimental fair chunked prefill (0 = off)
+    volumes:
+      - ${MODEL_DIR:?set MODEL_DIR in the vars file}:/model:ro
+      - ../logs:/logs
+      - jitcache:/cache
+      - ../patches/vllm/marlin_utils_fp4.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py:ro
+      - ../patches/vllm/dsv32_kernels.py:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v32/common/kernels.py:ro
+      - ../patches/vllm/mqa_logits_triton.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/mqa_logits_triton.py:ro
+      - ../patches/vllm/xpu_mla_sparse.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/xpu_mla_sparse.py:ro
+      - ../patches/vllm/config_vllm.py:/usr/local/lib/python3.12/dist-packages/vllm/config/vllm.py:ro
+      - ../patches/vllm/engine_core.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py:ro
+      - ../patches/vllm/scheduler.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py:ro
+      - ../patches/vllm/indexer.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py:ro
+      - ../patches/vllm/vocab_parallel_embedding.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/vocab_parallel_embedding.py:ro
+      - ../patches/vllm/v32_mtp.py:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v32/nvidia/mtp.py:ro
+    ports: [ "127.0.0.1:${PORT:-8000}:8000" ]
+    networks: [ glm53 ]
+    deploy:
+      resources:
+        reservations:
+          devices: [ { driver: nvidia, count: all, capabilities: [gpu] } ]
+    logging: { driver: local, options: { max-size: "20m", max-file: "3" } }
+    healthcheck:
+      test: [ "CMD", "curl", "-sf", "http://127.0.0.1:8000/health" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45m
+    command: >
+      /model --served-model-name ${SERVED_MODEL_NAME:-glm-5.3}
+      --tensor-parallel-size ${TP:-1} --pipeline-parallel-size ${PP:-8}
+      --distributed-executor-backend mp
+      --attention-backend TRITON_MLA_SPARSE
+      --max-model-len ${MAX_LEN:-32768} --gpu-memory-utilization ${UTIL:-0.94}
+      --kv-cache-dtype ${KV_DTYPE:-bfloat16} --trust-remote-code ${DISABLE_CAR---disable-custom-all-reduce}
+      --enable-chunked-prefill --max-num-seqs ${MAX_SEQS:-8} --max-num-batched-tokens ${MAX_BATCHED:-2048}
+      --compilation-config '{"cudagraph_mode":"${CG_MODE:-PIECEWISE}"}'
+      --host 0.0.0.0 --port 8000 ${EXTRA_ARGS:-}
+volumes:
+  jitcache: {}
+networks:
+  glm53: {}

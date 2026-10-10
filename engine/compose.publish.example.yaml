@@ -1,0 +1,7 @@
+# OPTIONAL example: also publish the API on one more address of the server (for example a
+# private LAN or VPN interface), in addition to 127.0.0.1. Copy to compose.publish.yaml,
+# replace the placeholder address, and append it to COMPOSE_FILE in your vars file.
+# The API has no authentication: never bind it to a public address.
+services:
+  vllm:
+    ports: [ "203.0.113.10:8000:8000" ]   # placeholder (TEST-NET-3): use your server's private address

@@ -1,0 +1,35 @@
+# Offline (CPU-only) PipeSpec tools. From the repository root:
+#   docker compose -f pipespec/compose.yaml run --rm model     # throughput model tables
+#   docker compose -f pipespec/compose.yaml run --rm check     # py_compile the patches + protocol simulation
+name: glm53-pipespec
+services:
+  model:
+    image: python:3.12.12-slim
+    restart: "no"
+    init: true
+    read_only: true
+    network_mode: none
+    tmpfs: ["/tmp:size=64m"]
+    environment: { PYTHONDONTWRITEBYTECODE: "1" }
+    volumes: [ "./:/pipespec:ro" ]
+    entrypoint: ["python3", "-I", "/pipespec/model.py"]
+    cpus: 2
+    mem_limit: 1g
+    pids_limit: 64
+    logging: { driver: local, options: { max-size: "20m", max-file: "3" } }
+  check:
+    image: python:3.12.12-slim
+    restart: "no"
+    init: true
+    read_only: true
+    network_mode: none
+    tmpfs: ["/tmp:size=64m"]
+    environment: { PYTHONDONTWRITEBYTECODE: "1" }
+    volumes:
+      - "./:/pipespec:ro"
+      - "../patches/vllm:/ported:ro"
+    entrypoint: ["python3", "-I", "/pipespec/check.py"]
+    cpus: 2
+    mem_limit: 1g
+    pids_limit: 64
+    logging: { driver: local, options: { max-size: "20m", max-file: "3" } }

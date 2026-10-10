@@ -1,0 +1,160 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
++
++from vllm.v1 import cmp_pipespec as _cmp_ps
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -326,6 +329,10 @@
+         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+         # cadence (`next_decode_eligible_step`).
+         self.current_step = 0
++        # PipeSpec (inert unless CMP_PIPESPEC=1): two-chunk speculative
++        # epochs for a lone decoding request (vllm/v1/cmp_pipespec.py).
++        self._pipespec = _cmp_ps.SchedulerPipeSpec(self)
++        self.num_lookahead_tokens = self._pipespec.lookahead(self.num_lookahead_tokens)
+         # DP prefill balancing: Flag to track whether the last cadence-aligned
+         # prefill batch fully drained the waiting queue. Prefill throttling
+         # is disabled in this case.
+@@ -609,6 +616,21 @@
+         defer_prefills = (
+             throttle_prefills and not self.prefill_capacity_bound
+         ) and any(not r.is_prefill_chunk for r in self.running)
++        # recipe patch (2026-10-09): the power-cap throttle (CMP_PREFILL_INFLIGHT_CAP,
++        # engine core) defers prefill unconditionally; a lone long prefill must be capped too.
++        if throttle_prefills and os.environ.get("CMP_PREFILL_INFLIGHT_CAP"):
++            defer_prefills = True
++        # recipe patch (2026-10-10): fair chunked prefill (port of the Flash recipe's
++        # prefill_chunk_with_decodes / FAIR_CHUNK). While any running request is decoding,
++        # cap the total PREFILL tokens per step at CMP_FAIR_CHUNK so a long prompt can't
++        # stall other sessions' decode; decode tokens are not capped. Off when unset/0, and a
++        # prompt arriving into an idle engine (nothing decoding) keeps the full chunk budget.
++        _cmp_fair_cap = int(os.environ.get("CMP_FAIR_CHUNK", "0") or 0)
++        fair_prefill_left = (
++            _cmp_fair_cap
++            if _cmp_fair_cap > 0 and any(not r.is_prefill_chunk for r in self.running)
++            else None
++        )
+ 
+         # First, schedule the RUNNING requests.
+         req_index = 0
+@@ -663,6 +685,11 @@
+             )
+             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
++            if fair_prefill_left is not None and request.is_prefill_chunk:
++                if fair_prefill_left <= 0:
++                    req_index += 1
++                    continue
++                num_new_tokens = min(num_new_tokens, fair_prefill_left)
+             num_new_tokens = min(
+                 num_new_tokens, token_budget, input_budget - draft_slots
+             )
+@@ -675,6 +702,23 @@
+                 - request.num_computed_tokens
+                 - self.num_sampled_tokens_per_step,
+             )
++
++            if (
++                self._pipespec.enabled
++                and self._pipespec.is_b_step(request, self.current_step)
++                and not (
++                    self._pipespec.b_token_ok(num_new_tokens)
++                    and num_new_tokens
++                    + request.num_computed_tokens
++                    - request.num_tokens
++                    - request.num_output_placeholders
++                    == self.num_spec_tokens
++                )
++            ):
++                # PipeSpec: chunk B must be exactly 1 + k tokens, else the
++                # request is not decoded again before its normal cadence step.
++                req_index += 1
++                continue
+ 
+             # Apply Mamba alignment before encoder caps.
+             if self.need_mamba_block_aligned_split:
+@@ -795,6 +839,8 @@
+             # Schedule the request.
+             scheduled_running_reqs.append(request)
+             prefill_scheduled |= request.is_prefill_chunk
++            if fair_prefill_left is not None and request.is_prefill_chunk:
++                fair_prefill_left -= num_new_tokens
+             request_id = request.request_id
+             req_to_new_blocks[request_id] = new_blocks
+             num_scheduled_tokens[request_id] = num_new_tokens
+@@ -846,7 +892,12 @@
+             assert len(scheduled_loras) <= self.lora_config.max_loras
+ 
+         # Next, schedule the WAITING requests.
+-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
++        if (
++            not preempted_reqs
++            and self._pause_state == PauseState.UNPAUSED
++            # PipeSpec: a chunk-B step carries only its request.
++            and not self._pipespec.b_step_pending(self.current_step)
++        ):
+             step_skipped_waiting = create_request_queue(self.policy)
+ 
+             while (self.waiting or self.skipped_waiting) and token_budget > 0:
+@@ -1060,6 +1111,11 @@
+                     threshold = self.scheduler_config.long_prefill_token_threshold
+                     if 0 < threshold < num_new_tokens:
+                         num_new_tokens = threshold
++                    if fair_prefill_left is not None:
++                        # fair chunked prefill: waiting requests are prefills.
++                        if fair_prefill_left <= 0:
++                            break
++                        num_new_tokens = min(num_new_tokens, fair_prefill_left)
+ 
+                     # chunked prefill has to be enabled explicitly to allow
+                     # pooling requests to be chunked
+@@ -1258,6 +1314,8 @@
+                 )
+                 num_scheduled_tokens[request_id] = num_new_tokens
+                 token_budget -= num_new_tokens
++                if fair_prefill_left is not None:
++                    fair_prefill_left -= num_new_tokens
+                 input_budget -= num_new_tokens + draft_slots
+                 request.status = RequestStatus.RUNNING
+                 request.num_computed_tokens = num_computed_tokens
+@@ -1451,6 +1509,8 @@
+ 
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
+             self._update_after_schedule(scheduler_output)
++        # PipeSpec: after the async scheduler set next_decode_eligible_step.
++        self._pipespec.after_schedule(self, scheduler_output)
+         return scheduler_output
+ 
+     def _build_kv_connector_meta(
+@@ -1938,6 +1998,7 @@
+         # to avoid expensive operations inside the loop.
+         stopped_running_reqs: set[Request] = set()
+         stopped_preempted_reqs: set[Request] = set()
++        cmp_ps_marks = _cmp_ps.markers(scheduler_output)
+         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+             assert num_tokens_scheduled > 0
+             request = self.requests.get(req_id)
+@@ -1970,6 +2031,17 @@
+             generated_token_ids = (
+                 sampled_token_ids[req_index] if sampled_token_ids else []
+             )
++            if cmp_ps_marks and req_id in cmp_ps_marks:
++                ps_mark = cmp_ps_marks[req_id]
++                if ps_mark == "B" and not generated_token_ids and not output_is_stale:
++                    # PipeSpec: the last PP stage dropped chunk B (chunk A
++                    # did not end on B's first token). Undo B's optimistic
++                    # accounting; earlier ranks roll back via the PP broadcast.
++                    request.num_computed_tokens -= num_tokens_scheduled
++                    request.num_output_placeholders = max(
++                        0, request.num_output_placeholders - num_tokens_scheduled
++                    )
++                self._pipespec.on_output(req_id, ps_mark, len(generated_token_ids))
+ 
+             scheduled_spec_token_ids = (
+                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)

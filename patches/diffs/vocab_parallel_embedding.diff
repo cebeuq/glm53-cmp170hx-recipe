@@ -1,0 +1,70 @@
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -79,6 +79,8 @@
+             current_platform.is_cuda_alike() or current_platform.is_xpu()
+         ):
+             return linear_batch_invariant(x, layer.weight, bias)
++        if _cmp_lmhead_ok(x, layer.weight, bias):
++            return _cmp_lmhead(x, layer.weight)
+         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+ 
+     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+@@ -627,3 +629,58 @@
+     def forward(self, input_):
+         del input_
+         raise RuntimeError("LMHead's weights should be used in the sampler.")
++
++# recipe patch (2026-10-09): batch<=16 lm_head GEMV via a Triton tl.dot kernel.
++# Measured on CMP 170HX (sm_80, 1695 MHz): [1x6144]x[6144x154880] bf16 1125 us (1.69 TB/s)
++# vs cuBLAS F.linear 1677 us (1.13 TB/s). fp32 accumulation; inert unless CMP_LMHEAD_TRITON=1.
++import os as _cmp_os
++
++_CMP_LMHEAD = _cmp_os.environ.get("CMP_LMHEAD_TRITON", "0") == "1"
++_cmp_kernel = None
++
++
++def _cmp_build():
++    global _cmp_kernel
++    from vllm.triton_utils import tl, triton
++
++    @triton.jit
++    def _k(x_ptr, w_ptr, o_ptr, M, N, K, sxm, swn, som,
++           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
++        pid = tl.program_id(0)
++        rn = pid * BLOCK_N + tl.arange(0, BLOCK_N)
++        rm = tl.arange(0, BLOCK_M)
++        rk = tl.arange(0, BLOCK_K)
++        nmask = rn < N
++        mmask = rm < M
++        w_ptrs = w_ptr + rn[:, None].to(tl.int64) * swn + rk[None, :]
++        x_ptrs = x_ptr + rm[None, :] * sxm + rk[:, None]
++        acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
++        for _kk in range(0, K, BLOCK_K):
++            w = tl.load(w_ptrs, mask=nmask[:, None], other=0.0)
++            xx = tl.load(x_ptrs, mask=mmask[None, :], other=0.0)
++            acc = tl.dot(w, xx, acc)
++            w_ptrs += BLOCK_K
++            x_ptrs += BLOCK_K
++        o_ptrs = o_ptr + rm[None, :] * som + rn[:, None]
++        tl.store(o_ptrs, acc.to(o_ptr.dtype.element_ty), mask=nmask[:, None] & mmask[None, :])
++
++    _cmp_kernel = (_k, triton)
++
++
++def _cmp_lmhead_ok(x, w, bias):
++    return (_CMP_LMHEAD and bias is None and x.dim() == 2 and 0 < x.shape[0] <= 16
++            and x.is_cuda and x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16
++            and w.dim() == 2 and w.stride(1) == 1 and x.stride(1) == 1
++            and x.shape[1] == w.shape[1] and w.shape[1] % 256 == 0)
++
++
++def _cmp_lmhead(x, w):
++    if _cmp_kernel is None:
++        _cmp_build()
++    k, triton = _cmp_kernel
++    M, K = x.shape
++    N = w.shape[0]
++    out = torch.empty((M, N), dtype=x.dtype, device=x.device)
++    k[(triton.cdiv(N, 32),)](x, w, out, M, N, K, x.stride(0), w.stride(0), out.stride(0),
++                             BLOCK_M=16, BLOCK_N=32, BLOCK_K=256, num_warps=4, num_stages=4)
++    return out

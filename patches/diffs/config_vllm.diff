@@ -1,0 +1,27 @@
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -584,13 +584,20 @@
+         # PP requires PP-size concurrent batches to fill the pipeline.
+         # Async scheduling requires 2 concurrent batches to overlap.
+         pp_size = self.parallel_config.pipeline_parallel_size
++        value = pp_size
+         if self.scheduler_config.async_scheduling:
+             if self.use_v2_model_runner:
+-                return pp_size + 1
++                value = pp_size + 1
+             # V1 Model Runner does not fully support async scheduling with PP.
+-            if pp_size <= 1:
+-                return 2
+-        return pp_size
++            elif pp_size <= 1:
++                value = 2
++        # recipe patch (2026-10-09): cap in-flight batches so long chunked prefills keep at
++        # most N pipeline stages computing at once (wall-power limit on a single PSU circuit).
++        # Single-stream decode has one batch in flight and is unaffected.
++        cap = os.environ.get("CMP_MAX_CONCURRENT_BATCHES")
++        if cap:
++            value = max(1, min(value, int(cap)))
++        return value
+ 
+     @property
+     def max_in_flight_tokens(self) -> int:

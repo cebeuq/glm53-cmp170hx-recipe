@@ -1,0 +1,14 @@
+# Stock driver, no peer-to-peer: TP2 x PP4, NCCL over host shared memory, BF16 KV,
+# stock MTP k=2 (with the PP embedding fix), 131,072 tokens, 4 sequences.
+# Measured: chat coding 58.2 / browse 58.5 / prose 53.1 tok/s; raw-prose harness 54.9 tok/s.
+MODEL_DIR=/path/to/models/glm53-abliterated-nvfp4e-int8r
+SERVED_MODEL_NAME=glm-5.3
+TP=2
+PP=4
+CG_MODE=FULL_AND_PIECEWISE
+MAX_LEN=131072
+UTIL=0.96
+MAX_SEQS=4
+KV_DTYPE=bfloat16
+ENV_FILE=env/nop2p-tp2pp4.env
+EXTRA_ARGS=--reasoning-parser glm45 --tool-call-parser glm47 --enable-auto-tool-choice --speculative-config '{"method":"mtp","num_speculative_tokens":2,"use_local_argmax_reduction":true}'

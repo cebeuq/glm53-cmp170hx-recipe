@@ -1,0 +1,13 @@
+# Simplest layout: PP8 (one GPU per stage), no P2P, no speculation, BF16 KV, 524,288 tokens.
+# Measured: 31.0 tok/s single stream, 96.9 tok/s at 4 streams, 1,728 tok/s prefill (13K prompt).
+MODEL_DIR=/path/to/models/glm53-abliterated-nvfp4e-int8r
+SERVED_MODEL_NAME=glm-5.3
+TP=1
+PP=8
+CG_MODE=FULL_AND_PIECEWISE
+MAX_LEN=524288
+UTIL=0.96
+MAX_SEQS=4
+KV_DTYPE=bfloat16
+ENV_FILE=env/nop2p-pp8.env
+EXTRA_ARGS=--reasoning-parser glm45 --tool-call-parser glm47 --enable-auto-tool-choice

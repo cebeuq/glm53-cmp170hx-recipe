@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1.7
+# P2P test tools on top of the serving image (same CUDA 13.0 nvcc, NCCL, vLLM fork),
+# so NCCL and vLLM custom all-reduce numbers match what serving sees.
+FROM lazymio/vllm-backport@sha256:2627d2a97e7f539b99ac98f511c589f5f520d3fc5630b195aca7f6ef865ead4e
+
+ADD --checksum=sha256:63cc9d5d8280c87df3c1f4e2276234a0f42cc497c52b40dd5bdda2836607db79 \
+    https://github.com/NVIDIA/cuda-samples/archive/refs/tags/v13.0.tar.gz /opt/src/cuda-samples.tar.gz
+ADD --checksum=sha256:7c06d6e11ce0b5df4342c2c57b847d53dc3b66751992e8680702f5326ce1e495 \
+    https://github.com/NVIDIA/nccl-tests/archive/refs/tags/v2.21.1.tar.gz /opt/src/nccl-tests.tar.gz
+# p2p_probe.cu: the byte-exact peer-transfer content check from Morrowmake's GLM-5.3-Flash
+# CMP 170HX recipe (MIT), pinned to release 1.7.2: cudaMemcpyPeer, SM peer write, SM peer read
+# and a cross-process CUDA IPC write, at 9 sizes from 128 KiB-1 to 32 MiB.
+ADD --checksum=sha256:d1a4ce4e68f7a4634c8fe3eede22849b92a661a220e6a592b3469b655d8a4d12 \
+    https://raw.githubusercontent.com/Morrowmake/glm53-flash-cmp170hx-recipe/cb3311eb980ac67e890c185f98dddda57e2abd48/p2p_probe.cu /opt/src/p2p_probe.cu
+
+ARG NCCL_PIP=/usr/local/lib/python3.12/dist-packages/nvidia/nccl
+RUN set -eux; cd /opt/src; mkdir -p /opt/p2p/bin /opt/nccl/lib; \
+    nvcc -O2 -std=c++17 -arch=sm_80 -o /opt/p2p/bin/p2p_probe p2p_probe.cu; \
+    tar xzf cuda-samples.tar.gz; \
+    nvcc -O2 -arch=sm_80 -I cuda-samples-13.0/Common -o /opt/p2p/bin/p2pBandwidthLatencyTest \
+      cuda-samples-13.0/Samples/5_Domain_Specific/p2pBandwidthLatencyTest/p2pBandwidthLatencyTest.cu; \
+    ln -s ${NCCL_PIP}/lib/libnccl.so.2 /opt/nccl/lib/libnccl.so; ln -s ${NCCL_PIP}/include /opt/nccl/include; \
+    tar xzf nccl-tests.tar.gz; \
+    make -C nccl-tests-2.21.1 -j8 MPI=0 CUDA_HOME=/usr/local/cuda NCCL_HOME=/opt/nccl BIN_FILES_LIST="all_reduce sendrecv" \
+      NVCC_GENCODE="-gencode=arch=compute_80,code=sm_80"; \
+    cp nccl-tests-2.21.1/build/all_reduce_perf nccl-tests-2.21.1/build/sendrecv_perf /opt/p2p/bin/; \
+    rm -rf /opt/src/cuda-samples-13.0 /opt/src/nccl-tests-2.21.1
+
+ENV LD_LIBRARY_PATH=${NCCL_PIP}/lib:${LD_LIBRARY_PATH} \
+    PATH=/opt/p2p/bin:${PATH}

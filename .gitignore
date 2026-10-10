@@ -1,0 +1,24 @@
+# Local configuration (copy the *.example files)
+engine/*.vars
+engine/variants/*.vars
+engine/compose.publish.yaml
+
+# Server output and run artifacts
+logs/
+RESULTS.ndjson
+goldens/
+bench/data/
+
+# P2P build / backup / test artifacts (kernel modules, driver tarball)
+p2p/out/
+p2p/cache/
+p2p/rollback/
+p2p/test-out/
+
+# Never commit weights
+models/
+*.safetensors
+
+__pycache__/
+*.pyc
+.DS_Store

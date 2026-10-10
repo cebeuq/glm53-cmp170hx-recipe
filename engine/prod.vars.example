@@ -1,0 +1,26 @@
+# Production configuration (copy to prod.vars and set MODEL_DIR):
+#   TP2 x PP4 (layers 22,20,20,16) + PCIe P2P (NCCL + vLLM custom all-reduce)
+#   + int8-tile latent KV (fp8_ds_mla layout) + stock MTP k=2 + PipeSpec,
+#   524,288-token context, 8 concurrent sequences.
+# Measured: KV pool 569,792 tokens; 8-stream aggregate 135.5 tok/s; 520K-token ladder passes.
+# Requires the P2P driver (docs/p2p.md). Without it use variants/no-p2p-128k.vars.example.
+#
+#   cd engine && docker compose --env-file prod.vars config --quiet
+#   cd engine && docker compose --env-file prod.vars up -d
+MODEL_DIR=/path/to/models/glm53-abliterated-nvfp4e-int8r
+SERVED_MODEL_NAME=glm-5.3
+TP=2
+PP=4
+CG_MODE=FULL_AND_PIECEWISE
+MAX_LEN=524288
+UTIL=0.97
+MAX_SEQS=8
+KV_DTYPE=fp8_ds_mla
+ENV_FILE=env/p2p-tp2pp4.env
+EXTRA_ARGS=--reasoning-parser glm45 --tool-call-parser glm47 --enable-auto-tool-choice --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+DISABLE_CAR=
+COMPOSE_FILE=compose.yaml:compose.p2p.yaml:compose.kvfp8.yaml:compose.kvfp8i8.yaml:compose.pipespec.yaml
+CMP_PIPESPEC=1
+CMP_PIPESPEC_REFILL=0
+# Experimental fair chunked prefill (docs/how-it-works.md#fair-chunked-prefill-experimental):
+# CMP_FAIR_CHUNK=384

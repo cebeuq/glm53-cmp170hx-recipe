@@ -1,0 +1,29 @@
+# P2P test battery (one-shot; all GPUs; the engine must be stopped). From the repo root:
+#   mkdir -p p2p/test-out && docker compose -f p2p/tests/compose.yaml run --rm p2ptools [stages]
+# Image = serving image + p2p_probe, p2pBandwidthLatencyTest, nccl-tests (see Dockerfile.tools).
+name: glm53-p2ptest
+services:
+  p2ptools:
+    build: { context: ., dockerfile: Dockerfile.tools }
+    image: glm53-recipe/p2p-tools:1
+    restart: "no"
+    network_mode: none
+    init: true
+    user: "${UID_GID:-1000:1000}"
+    shm_size: 8g
+    pids_limit: 4096
+    mem_limit: 64g
+    environment:
+      HOME: /tmp
+      VLLM_CACHE_ROOT: /tmp/vllm-cache
+      P2P_CHECK_CACHE: /tmp/p2p-cache
+      NCCL_DEBUG: ${NCCL_DEBUG:-WARN}
+    volumes:
+      - ./:/tests:ro
+      - ../test-out:/test-out
+    deploy:
+      resources:
+        reservations:
+          devices: [ { driver: nvidia, count: all, capabilities: [gpu] } ]
+    logging: { driver: local, options: { max-size: "20m", max-file: "3" } }
+    entrypoint: [ "bash", "/tests/run_tests.sh" ]

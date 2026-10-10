@@ -1,0 +1,333 @@
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -62,6 +62,7 @@
+ )
+ from vllm.sequence import IntermediateTensors
+ from vllm.tasks import SupportedTask
++from vllm.v1 import cmp_pipespec as _cmp_ps
+ from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
+ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+@@ -329,6 +330,27 @@
+                 device=self.device,
+             )
+ 
++        # PipeSpec (vllm/v1/cmp_pipespec.py; inert unless CMP_PIPESPEC=1).
++        # Step marker of the current execute_model/sample_tokens pair: N, A or B.
++        self._ps_on = (
++            _cmp_ps.ENABLED
++            and self.use_pp
++            and self.num_speculative_steps == _cmp_ps.SUPPORTED_K
++        )
++        self._ps_mark = "N"
++        # Last PP rank only:
++        self._ps_p2: torch.Tensor | None = None  # [1, k+1] drafts for next chunk B
++        self._ps_p2_req = -1  # req_idx the P2 drafts belong to
++        self._ps_expect_b = False  # chunk A done, chunk B not yet executed
++        self._ps_b_valid = False
++        self._ps_a_req = -1
++        self._ps_a_drafts: torch.Tensor | None = None  # drafts chunk A verified
++        self._ps_b_drafts: torch.Tensor | None = None  # drafts chunk B verifies
++        self._ps_pending: tuple | None = None  # (p1, ev1, p2, ev2) of a failed A
++        self._ps_skip: list[str] | None = None  # dropped chunk B request ids
++        self._ps_flag_host: torch.Tensor | None = None
++        self._ps_flag_event: torch.cuda.Event | None = None
++
+         # Samplers and decode_query_len created in load_model() after
+         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
+         self.sampler: Sampler | None = None
+@@ -1031,6 +1053,8 @@
+             self.pooling_runner.remove_request(req_idx)
+         if self.pp_handler is not None:
+             self.pp_handler.on_req_idx_freed(req_idx)
++        if self._ps_on:
++            self._ps_forget(req_idx)
+         if self.encoder_cache is not None:
+             self.encoder_cache.remove_request(req_id)
+         if self.prompt_logprobs_worker is not None:
+@@ -1066,6 +1090,13 @@
+             )
+             if outputs is not None:
+                 self.postprocess_sampled(**outputs)
++            # PipeSpec: the chunk-B result of that epoch (if any) applies
++            # right after its chunk A, and carries the next epoch's drafts.
++            b_outputs = self.pp_handler.take_chunk_b_outputs(
++                self.req_states.draft_tokens
++            )
++            if b_outputs is not None:
++                self.postprocess_sampled(**b_outputs)
+ 
+     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+         for new_req_data in scheduler_output.scheduled_new_reqs:
+@@ -1587,6 +1618,14 @@
+                 return self._merge_ec_connector_no_forward(
+                     scheduler_output, empty_output
+                 )
++            if self._ps_on and self._ps_pre_execute(scheduler_output):
++                # PipeSpec: dropped chunk B on the last rank. Drain the
++                # hidden states stage PP-2 sent; sample_tokens() reports it.
++                if isinstance(intermediate_tensors, IntermediateTensors):
++                    _ = intermediate_tensors.tensors
++                return None
++        else:
++            self._ps_mark = "N"
+ 
+         # Get batch descriptor and sync across DP ranks.
+         num_reqs = len(scheduler_output.num_scheduled_tokens)
+@@ -1649,6 +1688,8 @@
+             input_batch = self.prepare_inputs(
+                 scheduler_output, batch_req_state, batch_desc
+             )
++            if self._ps_mark == "B" and self.is_first_pp_rank:
++                self._ps_set_chunk_b_inputs(input_batch)
+             block_tables, slot_mappings = self.prepare_attn(input_batch)
+             # Mamba "align" pre-copy: migrate recurrent state across block
+             # boundaries before the forward. Runs only on real batches, and
+@@ -1927,6 +1968,8 @@
+     def sample_tokens(
+         self, grammar_output: GrammarOutput | None
+     ) -> AsyncOutput | ModelRunnerOutput | None:
++        if self._ps_skip is not None:
++            return self._ps_dropped_chunk_output()
+         if self.execute_model_state is None:
+             # The prior execute_model call must have failed.
+             return None
+@@ -1948,7 +1991,7 @@
+             # IntermediateTensors instead of final hidden states. Receive the
+             # sampled tokens broadcast from the last rank and update local state.
+             assert self.pp_handler is not None
+-            all_decode_next = self.pp_handler.receive(input_batch)
++            all_decode_next = self.pp_handler.receive(input_batch, self._ps_mark)
+             # Optimistically update num_computed_tokens for entire batch here.
+             # Will be adjusted for rejections if necessary in update_requests.
+             self.postprocess_num_computed_tokens(input_batch)
+@@ -2043,7 +2086,16 @@
+             input_batch.query_start_loc,
+         )
+ 
+-        if self.speculator is not None:
++        ps_mark = self._ps_mark
++        skip_propose = False
++        if ps_mark == "A":
++            # PipeSpec: host sync; True iff chunk B (in flight) is valid.
++            skip_propose = self._ps_decide_chunk_a(
++                input_batch, sampler_output, num_rejected
++            )
++
++        draft_tokens = None
++        if self.speculator is not None and (not skip_propose or _cmp_ps.REFILL):
+             assert self.sampler is not None
+             # Let the target override the hidden state fed to the drafter
+             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
+@@ -2075,6 +2127,13 @@
+                     self.speculator.draft_token_confidence_probs, input_batch
+                 )
+ 
++        if skip_propose:
++            # PipeSpec: chunk B verifies the previous epoch's P2 drafts.
++            self._ps_arm_chunk_b(input_batch)
++        elif ps_mark in ("A", "B"):
++            # PipeSpec: epoch ends here; P1 (next A) and P2 (next B).
++            self._ps_finish_epoch(input_batch, draft_tokens, send_now=ps_mark == "B")
++
+         if self.num_speculative_steps > 0:
+             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
+             # not have a speculator (i.e. self.speculator is None)
+@@ -2082,7 +2141,7 @@
+                 input_batch,
+                 self.req_states.draft_tokens[input_batch.idx_mapping],
+             )
+-            if self.pp_handler is not None:
++            if self.pp_handler is not None and ps_mark == "N":
+                 self.pp_handler.broadcast_drafts(
+                     self.req_states.draft_tokens, input_batch
+                 )
+@@ -2094,6 +2153,188 @@
+ 
+         return async_output
+ 
++    # ------------------------------------------------------------------------
++    # PipeSpec (vllm/v1/cmp_pipespec.py). Epoch = chunk A at step e and
++    # chunk B at step e+1 for one request; B was issued by the first rank before
++    # A was verified. Only the last rank knows whether B is valid; message
++    # shapes depend on the step markers alone, so all ranks stay in lockstep.
++    # ------------------------------------------------------------------------
++    def _ps_pre_execute(self, scheduler_output: SchedulerOutput) -> bool:
++        """Set this step's marker. Last rank: returns True to skip the forward
++        of a dropped chunk B."""
++        marks = _cmp_ps.markers(scheduler_output)
++        mark, req_id = "N", None
++        if marks:
++            assert len(marks) == 1 and len(scheduler_output.num_scheduled_tokens) == 1, (
++                marks
++            )
++            ((req_id, mark),) = marks.items()
++        self._ps_mark = mark
++        if not self.is_last_pp_rank:
++            return False
++        k = self.num_speculative_steps
++        req_idx = self.req_states.req_id_to_index[req_id] if req_id else -1
++        if self._ps_expect_b and mark != "B":
++            # Chunk A without chunk B (abort/pause race). The earlier ranks still
++            # hold the drafts chunk A verified, so this rank must use them too.
++            self._ps_restore_a_drafts()
++        if mark == "A":
++            self._ps_a_req = req_idx
++            self._ps_a_drafts = self.req_states.draft_tokens[req_idx, :k].clone()
++            if self._ps_p2_req != req_idx:
++                self._ps_p2 = None
++            return False
++        if mark == "B":
++            assert self._ps_expect_b and req_idx == self._ps_a_req, (
++                self._ps_expect_b,
++                req_idx,
++                self._ps_a_req,
++            )
++            if not self._ps_b_valid:
++                self._ps_skip = [req_id]
++                return True
++            return False
++        # Normal step: P2 drafts only feed an immediately following epoch.
++        if self._ps_p2 is not None:
++            for rid in scheduler_output.num_scheduled_tokens:
++                if self.req_states.req_id_to_index.get(rid) == self._ps_p2_req:
++                    self._ps_p2 = None
++                    self._ps_p2_req = -1
++                    break
++        return False
++
++    def _ps_restore_a_drafts(self) -> None:
++        if self._ps_a_req >= 0 and self._ps_a_drafts is not None:
++            k = self.num_speculative_steps
++            self.req_states.draft_tokens[self._ps_a_req, :k] = self._ps_a_drafts
++        self._ps_expect_b = False
++        self._ps_b_valid = False
++        self._ps_pending = None
++        self._ps_p2 = None
++        self._ps_p2_req = -1
++
++    def _ps_forget(self, req_idx: int) -> None:
++        if req_idx in (self._ps_a_req, self._ps_p2_req):
++            self._ps_expect_b = False
++            self._ps_b_valid = False
++            self._ps_a_req = -1
++            self._ps_a_drafts = None
++            self._ps_b_drafts = None
++            self._ps_pending = None
++            self._ps_p2 = None
++            self._ps_p2_req = -1
++
++    def _ps_set_chunk_b_inputs(self, input_batch: InputBatch) -> None:
++        """First rank: chunk B's input ids are the previous epoch's P2 drafts.
++        Without them (first epoch) the inputs are stale and the last rank drops
++        the chunk, because it has no P2 either."""
++        assert self.pp_handler is not None and input_batch.num_reqs == 1
++        p2 = self.pp_handler.take_p2_for_chunk_b(int(input_batch.idx_mapping_np[0]))
++        if p2 is None:
++            return
++        n = self.num_speculative_steps + 1
++        start = int(input_batch.query_start_loc_np[0])
++        input_batch.input_ids[start : start + n].copy_(p2[:n])
++
++    def _ps_decide_chunk_a(
++        self,
++        input_batch: InputBatch,
++        sampler_output: SamplerOutput,
++        num_rejected: torch.Tensor,
++    ) -> bool:
++        """Last rank, after verifying chunk A: chunk B is valid iff A accepted
++        all k drafts and A's bonus token equals B's first input (P2[0]).
++        One host sync; identical on all TP ranks (same sampled tokens)."""
++        k = self.num_speculative_steps
++        req_idx = int(input_batch.idx_mapping_np[0])
++        self._ps_expect_b = True
++        self._ps_b_valid = False
++        self._ps_b_drafts = None
++        self._ps_pending = None
++        p2 = self._ps_p2 if self._ps_p2_req == req_idx else None
++        self._ps_p2 = None
++        self._ps_p2_req = -1
++        if p2 is None or input_batch.num_reqs != 1:
++            return False
++        if self._ps_flag_host is None:
++            self._ps_flag_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
++            self._ps_flag_event = torch.cuda.Event()
++        assert self._ps_flag_event is not None
++        ok = (num_rejected[:1] == 0) & (
++            sampler_output.sampled_token_ids[:1, k] == p2[:1, 0]
++        )
++        self._ps_flag_host.copy_(ok.to(torch.int32), non_blocking=True)
++        self._ps_flag_event.record(self.main_stream)
++        self._ps_flag_event.synchronize()
++        valid = bool(self._ps_flag_host[0].item())
++        self._ps_b_valid = valid
++        if valid:
++            self._ps_b_drafts = p2[0, 1 : k + 1]
++        return valid
++
++    def _ps_arm_chunk_b(self, input_batch: InputBatch) -> None:
++        """Last rank: chunk B verifies P2[1:]; its first input is A's bonus,
++        already in last_sampled_tokens."""
++        assert self._ps_b_drafts is not None
++        k = self.num_speculative_steps
++        req_idx = int(input_batch.idx_mapping_np[0])
++        self.req_states.draft_tokens[req_idx, :k] = self._ps_b_drafts
++
++    def _ps_finish_epoch(
++        self,
++        input_batch: InputBatch,
++        draft_tokens: torch.Tensor | None,
++        send_now: bool,
++    ) -> None:
++        """Last rank: the epoch ended at this chunk. P1 = the k drafts just
++        proposed (next chunk A), P2 = the same chain continued by k+1 (next
++        chunk B). Sent now after a valid B; after a failed A they ride on the
++        dropped chunk B's message (sample_tokens of step e+1)."""
++        assert self.pp_handler is not None and draft_tokens is not None
++        k = self.num_speculative_steps
++        num_reqs = input_batch.num_reqs
++        p1 = draft_tokens[:num_reqs, :k].clone()
++        ev1 = torch.cuda.Event()
++        ev1.record(self.main_stream)
++        if send_now:
++            self.pp_handler.broadcast_rows(p1, ev1)
++        spec = self.speculator
++        p2_ok = getattr(spec, "num_p2", 0) == k + 1 and spec._chain_ctx is not None
++        if p2_ok:
++            with use_workspace_lane(self._draft_workspace_lane):
++                p2 = spec.continue_chain()[:num_reqs].clone()
++        else:
++            p2 = torch.zeros(num_reqs, k + 1, dtype=torch.int64, device=self.device)
++        ev2 = torch.cuda.Event()
++        ev2.record(self.main_stream)
++        if send_now:
++            self.pp_handler.broadcast_rows(p2, ev2)
++            self._ps_expect_b = False
++        else:
++            self._ps_pending = (p1, ev1, p2, ev2)
++        self._ps_p2 = p2 if (p2_ok and num_reqs == 1) else None
++        self._ps_p2_req = int(input_batch.idx_mapping_np[0])
++
++    def _ps_dropped_chunk_output(self) -> ModelRunnerOutput:
++        """Last rank, dropped chunk B: send its message (no tokens, k+1
++        rejected, then the epoch's P1/P2) and report no tokens."""
++        assert self.pp_handler is not None and self._ps_skip is not None
++        req_ids = self._ps_skip
++        self._ps_skip = None
++        pending = self._ps_pending
++        self._ps_pending = None
++        self._ps_expect_b = False
++        assert pending is not None, "PipeSpec: dropped chunk B without epoch drafts"
++        p1, ev1, p2, ev2 = pending
++        self.pp_handler.broadcast_dropped_chunk(len(req_ids))
++        self.pp_handler.broadcast_rows(p1, ev1)
++        self.pp_handler.broadcast_rows(p2, ev2)
++        return ModelRunnerOutput(
++            req_ids=req_ids,
++            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
++            sampled_token_ids=[[] for _ in req_ids],
++        )
++
+     def take_draft_token_ids(self) -> DraftTokenIds | None:
+         return self.draft_tokens_handler.get_draft_tokens()
+ 

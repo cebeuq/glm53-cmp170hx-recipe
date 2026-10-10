@@ -1,0 +1,104 @@
+--- a/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
+@@ -37,10 +37,18 @@
+ 
+ class XPUMLASparseBackend(AttentionBackend):
+     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
++    # recipe patch (2026-10-10, kvfp8): fp8 KV on SM80 via the Triton read path in
++    # v1/attention/ops/kvfp8_sparse_mla.py (write path: deepseek_v32 fused_norm_rope).
++    #   fp8 / fp8_e4m3: 576 B/token, per-tensor scale (layer._k_scale)
++    #   fp8_ds_mla:     656 B/token, per-token per-128-tile scales + bf16 rope
++    #                   (CMP_KV_DSMLA_INT8=1: int8 payload, needs kvfp8_dsv32_kernels.py)
+     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+         "auto",
+         "float16",
+         "bfloat16",
++        "fp8",
++        "fp8_e4m3",
++        "fp8_ds_mla",
+     ]
+ 
+     @staticmethod
+@@ -104,6 +112,11 @@
+     num_decodes: int = 0
+     num_prefills: int = 0
+     num_decode_tokens: int = 0
++    # recipe patch (2026-10-08): deepseek_v32/attention.py now calls
++    # MLAAttention._use_sparse_mha(), which reads `attn_metadata.prefill`
++    # unconditionally. This backend has no dense-MHA prefill, so expose None
++    # (=> _use_sparse_mha() returns False and every token takes the sparse MQA path).
++    prefill: None = None
+ 
+ 
+ @dataclass
+@@ -240,6 +253,61 @@
+         )
+ 
+         return output[:, : self.num_heads, :]
++
++    def _forward_fp8_kv(
++        self,
++        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
++        kv_cache: torch.Tensor,  # [blocks, block_size, 576 | 656] fp8 / uint8 view
++        attn_metadata: XPUMLASparseMetadata,
++        layer: AttentionLayer,
++    ) -> tuple[torch.Tensor, None]:
++        # recipe patch (2026-10-10, kvfp8): software-dequant fp8 sparse MLA (SM80).
++        from vllm.v1.attention.ops.kvfp8_sparse_mla import (
++            FMT_FP8,
++            dsmla_fmt,
++            kvfp8_sparse_mla_attention,
++        )
++
++        if self.kv_cache_dtype == "fp8_ds_mla":
++            fmt = dsmla_fmt()  # e4m3 payload, or int8 with CMP_KV_DSMLA_INT8=1
++        elif self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
++            fmt = FMT_FP8
++        else:
++            raise NotImplementedError(
++                f"kv cache dtype {self.kv_cache_dtype} is not supported by "
++                "the Triton sparse MLA backend"
++            )
++        if isinstance(q, tuple):
++            q = torch.cat(q, dim=-1)
++        num_actual_toks = q.shape[0]
++        buf = (
++            self._indexer.topk_indices_buffer
++            if self._indexer is not None
++            else self.topk_indices_buffer
++        )
++        assert buf is not None, "topk_indices_buffer required for sparse MLA"
++        topk_indices = buf[:num_actual_toks]
++        # Paged slot ids (block_id * block_size + offset); the kernel applies the
++        # real block stride itself, so any KV cache layout works.
++        slots = triton_convert_req_index_to_global_index(
++            attn_metadata.req_id_per_token,
++            attn_metadata.block_table,
++            topk_indices,
++            BLOCK_SIZE=attn_metadata.block_size,
++            BLOCK_STRIDE_ROWS=attn_metadata.block_size,
++            NUM_TOPK_TOKENS=topk_indices.shape[1],
++        )
++        k_scale = getattr(layer, "_k_scale", None) if fmt == FMT_FP8 else None
++        out = kvfp8_sparse_mla_attention(
++            q,
++            kv_cache.view(torch.uint8),
++            slots,
++            sm_scale=self.softmax_scale,
++            fmt=fmt,
++            k_scale=k_scale,
++            sm_count=getattr(self, "_sm_count", None),
++        )
++        return out[:, : self.num_heads, :], None
+ 
+     def forward_mqa(
+         self,
+@@ -252,7 +320,7 @@
+         # MQA 576/512 approach for both prefill and decode
+ 
+         if is_quantized_kv_cache(self.kv_cache_dtype):
+-            raise NotImplementedError("FP8 kv is not supported with XPU MLA Sparse yet")
++            return self._forward_fp8_kv(q, kv_c_and_k_pe_cache, attn_metadata, layer)
+ 
+         # Concatenate q if it's a tuple (ql_nope, q_pe)
+         if isinstance(q, tuple):

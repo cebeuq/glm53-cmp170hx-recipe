@@ -1,0 +1,40 @@
+--- a/vllm/v1/attention/ops/mqa_logits_triton.py
++++ b/vllm/v1/attention/ops/mqa_logits_triton.py
+@@ -8,7 +8,10 @@
+ import torch
+ 
+ from vllm import envs
++from vllm.logger import init_logger
+ from vllm.platforms import current_platform
++
++logger = init_logger(__name__)
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.platform_utils import num_compute_units
+ from vllm.v1.attention.ops.fp8_sm80 import get_e4m3fn_bf16_lut
+@@ -282,6 +285,26 @@
+     assert one == 1
+     assert d_plus_4 == head_dim + 4
+ 
++    # recipe patch: under FULL cudagraph capture this call is recorded into the
++    # graph, freezing the logits width and the launch grid at this batch's
++    # `max_model_len` (the caller passes the batch's max_seq_len to keep the
++    # buffer tight). The downstream top-k kernels read each row up to the
++    # *live* per-row seq_lens on replay, so a replay whose context exceeds the
++    # recorded width reads past the logits allocation (Xid 31 / IMA once a
++    # sequence outgrows the width recorded at capture). Clamp the width to
++    # span the whole block table when capturing: surplus grid columns exit on
++    # the context_len check, and the extra buffer is already accounted for by
++    # the profiling run's worst-case decode-logits reservation.
++    if torch.cuda.is_current_stream_capturing():
++        full_width = block_tables.shape[1] * block_size
++        logger.info_once(
++            "recipe patch: paged MQA logits captured with width %d "
++            "(caller max_model_len=%d, block_table %s x block_size %d)",
++            max(max_model_len, full_width), max_model_len,
++            tuple(block_tables.shape), block_size,
++        )
++        max_model_len = max(max_model_len, full_width)
++
+     # Cache layout from `indexer_k_quant_and_cache`: per block, FP8 K bytes
+     # (block_size * head_dim) followed by fp32 scales (block_size * 4). The
+     # `[NB, block_size, 1, head_dim+4]` shape is a stride trick; re-slice flat.

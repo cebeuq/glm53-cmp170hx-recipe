@@ -1,0 +1,8 @@
+# Overlay: vLLM custom all-reduce over PCIe peer-to-peer (needs the P2P driver, docs/p2p.md).
+# The patched file adds CMP_PCIE_CUSTOM_AR=1, which treats a TP group as fully connected so
+# TP > 2 may use the custom kernels (TP2 never needed it). Use with DISABLE_CAR= in the vars file
+# and an env file with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False and VLLM_SKIP_P2P_CHECK=0.
+services:
+  vllm:
+    volumes:
+      - ../patches/vllm/p2p_custom_all_reduce.py:/usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/custom_all_reduce.py:ro

@@ -1,0 +1,15 @@
+# Overlay: PipeSpec, pipelined speculative decoding across pipeline stages (docs/pipespec.md).
+# With CMP_PIPESPEC unset or 0 every patched file behaves like the image original (plus the
+# recipe's scheduler patch, which this file replaces: the PipeSpec scheduler contains it).
+services:
+  vllm:
+    environment:
+      CMP_PIPESPEC: "${CMP_PIPESPEC:-0}"
+      CMP_PIPESPEC_REFILL: "${CMP_PIPESPEC_REFILL:-0}"
+      CMP_PIPESPEC_LOG: "${CMP_PIPESPEC_LOG:-200}"
+    volumes:
+      - ../patches/vllm/pipespec_core.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/cmp_pipespec.py:ro
+      - ../patches/vllm/pipespec_scheduler.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py:ro
+      - ../patches/vllm/pipespec_pp_utils.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/pp_utils.py:ro
+      - ../patches/vllm/pipespec_model_runner.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py:ro
+      - ../patches/vllm/pipespec_ar_speculator.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py:ro

@@ -1,0 +1,5 @@
+# Example queue for loop/start_queue.sh (one candidate per line; paths relative to the repo root).
+# Format: CAND_ID VARS_FILE [run_candidate.sh flags]
+# Lines starting with '!' are shell steps that run with the engine stopped.
+base engine/prod.vars --no-quality --accept --gsm8k 250 --ladder 65536,262144,520000
+nops engine/variants/no-pipespec.vars --no-quality --accept
