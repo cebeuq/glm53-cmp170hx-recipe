@@ -1,0 +1,51 @@
+--- a/vllm/v1/structured_output/__init__.py
++++ b/vllm/v1/structured_output/__init__.py
+@@ -312,7 +312,16 @@
+                         window,
+                         delta_appended=False,
+                     )
++                # recipe: row filled from the last valid grammar state before a
++                # draft the grammar rejected; later rows reuse it (the sampler
++                # rejects that draft against its own row, so they are unused).
++                failed_index: int | None = None
++                bitmask = self._grammar_bitmask
+                 for i, token in enumerate(req_tokens):
++                    if failed_index is not None:
++                        bitmask[cumulative_index].copy_(bitmask[failed_index])
++                        cumulative_index += 1
++                        continue
+                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
+                     advance_grammar = apply_bitmask
+                     if token == -1:
+@@ -339,9 +348,17 @@
+                         if accepted:
+                             state_advancements += 1
+                         elif not post_reasoning_end_in_window:
+-                            raise AssertionError(
+-                                (token, req_id, scheduled_spec_decode_tokens)
++                            # recipe: a validated draft the
++                            # grammar still rejects (stale reasoning state) is
++                            # a per-request condition, never an engine crash.
++                            logger.error(
++                                "Unexpected: grammar rejected draft token %s for "
++                                "request %s during bitmask fill; the rest of "
++                                "the window keeps the last valid state.",
++                                token,
++                                req_id,
+                             )
++                            failed_index = cumulative_index
+                     cumulative_index += 1
+                 # Diffusion LLMs don't sample a bonus token after the
+                 # scheduled positions, so skip its bitmask in that case.
+@@ -357,7 +374,10 @@
+                     #   reasoning_ended is only persisted later by
+                     #   should_advance.
+                     bonus_apply = self.should_fill_bitmask(request) or apply_bitmask
+-                    self._fill_bitmasks(((grammar, cumulative_index, bonus_apply),))
++                    if failed_index is not None:
++                        bitmask[cumulative_index].copy_(bitmask[failed_index])
++                    else:
++                        self._fill_bitmasks(((grammar, cumulative_index, bonus_apply),))
+                     cumulative_index += 1
+                 if state_advancements > 0:
+                     grammar.rollback(state_advancements)

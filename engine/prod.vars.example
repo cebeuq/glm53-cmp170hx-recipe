@@ -19,7 +19,7 @@ KV_DTYPE=fp8_ds_mla
 ENV_FILE=env/p2p-tp2pp4.env
 EXTRA_ARGS=--reasoning-parser glm45 --tool-call-parser glm47 --enable-auto-tool-choice --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
 DISABLE_CAR=
-COMPOSE_FILE=compose.yaml:compose.p2p.yaml:compose.kvfp8.yaml:compose.kvfp8i8.yaml:compose.pipespec.yaml
+COMPOSE_FILE=compose.yaml:compose.p2p.yaml:compose.kvfp8.yaml:compose.kvfp8i8.yaml:compose.pipespec.yaml:compose.grammar.yaml
 CMP_PIPESPEC=1
 CMP_PIPESPEC_REFILL=0
 # Experimental fair chunked prefill (docs/how-it-works.md#fair-chunked-prefill-experimental):

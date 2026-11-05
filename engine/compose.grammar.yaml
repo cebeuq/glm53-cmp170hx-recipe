@@ -1,0 +1,16 @@
+# Overlay: grammar bitmask for draft tokens, i.e. structured output (json_schema, json_object,
+# named tool_choice) together with speculative decoding (docs/structured-output.md).
+# A port of vLLM #54442 onto this image and onto the PipeSpec scheduler and model runner.
+# Must come after compose.pipespec.yaml in COMPOSE_FILE: it replaces that overlay's
+# scheduler.py and model_runner.py mounts with files that contain them (same container path,
+# the later file wins). No switch: the files act only on requests that carry a grammar.
+services:
+  vllm:
+    volumes:
+      - ../patches/vllm/grammar_sched_output.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/output.py:ro
+      - ../patches/vllm/grammar_scheduler.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py:ro
+      - ../patches/vllm/grammar_structured_output_init.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/structured_output/__init__.py:ro
+      - ../patches/vllm/grammar_gpu_structured_outputs.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/structured_outputs.py:ro
+      - ../patches/vllm/grammar_batch_shard.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/sample/batch_shard.py:ro
+      - ../patches/vllm/grammar_rejection_sampler.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py:ro
+      - ../patches/vllm/grammar_model_runner.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py:ro
