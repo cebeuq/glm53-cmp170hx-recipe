@@ -30,8 +30,8 @@ SPDX header.
 | `pipespec_core.py` | `v1/cmp_pipespec.py` (new) | PipeSpec policy, flags and counters | `CMP_PIPESPEC=1` | yes |
 | `pipespec_scheduler.py` | `v1/core/sched/scheduler.py` | `scheduler.py` below + PipeSpec chunk-A/B scheduling and dropped-chunk rollback | `CMP_PIPESPEC=1` | yes (`compose.pipespec.yaml`) |
 | `pipespec_pp_utils.py` | `v1/worker/gpu/pp_utils.py` | PipeSpec stage-to-stage message formats | `CMP_PIPESPEC=1` | yes |
-| `pipespec_model_runner.py` | `v1/worker/gpu/model_runner.py` | PipeSpec epoch logic on the first and last stage | `CMP_PIPESPEC=1` | yes |
-| `pipespec_ar_speculator.py` | `v1/worker/gpu/spec_decode/autoregressive/speculator.py` | longer MTP draft chain (`continue_chain`) for PipeSpec | `CMP_PIPESPEC=1` | yes |
+| `pipespec_model_runner.py` | `v1/worker/gpu/model_runner.py` | PipeSpec epoch logic on the first and last stage; with probabilistic drafts, the draft logits each chunk is verified against | `CMP_PIPESPEC=1` | yes |
+| `pipespec_ar_speculator.py` | `v1/worker/gpu/spec_decode/autoregressive/speculator.py` | longer MTP draft chain (`continue_chain`) for PipeSpec; with probabilistic drafts, a draft-logits cache that covers the chain | `CMP_PIPESPEC=1` | yes |
 | `scheduler.py` | `v1/core/sched/scheduler.py` | prefill throttle hook; **experimental fair chunked prefill** | `CMP_PREFILL_INFLIGHT_CAP`, `CMP_FAIR_CHUNK` | base only (contained in `pipespec_scheduler.py`) |
 | `engine_core.py` | `v1/engine/core.py` | optional cap on in-flight PP batches that carry prefill (wall-power limiting) | `CMP_PREFILL_INFLIGHT_CAP=N` | mounted, off |
 | `config_vllm.py` | `config/vllm.py` | optional cap on concurrent PP batches | `CMP_MAX_CONCURRENT_BATCHES=N` | mounted, off |

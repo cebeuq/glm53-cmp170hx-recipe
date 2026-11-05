@@ -64,12 +64,16 @@ class SchedulerPipeSpec:
             and sched.scheduler_config.async_scheduling
             and spec is not None
             and spec.method == "mtp"
-            and getattr(spec, "draft_sample_method", "greedy") == "greedy"
+            # recipe: probabilistic drafts allowed; the
+            # validity rule (A fully accepted and bonus == d3) does not depend
+            # on how the drafts were drawn, and chunk B goes through the same
+            # rejection sampler with its own draft logits (model runner).
+            and getattr(spec, "draft_sample_method", "greedy") in ("greedy", "probabilistic")
         )
         if ENABLED and not self.enabled:
             logger.warning(
                 "CMP_PIPESPEC=1 ignored: needs PP>1, V2 runner, async scheduling, "
-                "MTP k=%d greedy drafts (got pp=%d k=%d)",
+                "MTP k=%d greedy or probabilistic drafts (got pp=%d k=%d)",
                 SUPPORTED_K,
                 self.pp,
                 self.k,

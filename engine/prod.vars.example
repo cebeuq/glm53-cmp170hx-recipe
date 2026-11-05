@@ -24,3 +24,6 @@ CMP_PIPESPEC=1
 CMP_PIPESPEC_REFILL=0
 # Experimental fair chunked prefill (docs/how-it-works.md#fair-chunked-prefill-experimental):
 # CMP_FAIR_CHUNK=384
+# Probabilistic drafts for sampled requests (docs/pipespec.md#probabilistic-drafts-sampled-requests):
+# add "draft_sample_method":"probabilistic" to the speculative config in EXTRA_ARGS, e.g.
+#   --speculative-config '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"probabilistic"}'
