@@ -11,6 +11,13 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1 import cmp_pipespec as _cmp_ps
+import os as _os
+
+# recipe (CMP_SQ_GREEDY_D3=1): with probabilistic drafts, draw the chain's bonus guess
+# d3 (chain step k) as the argmax instead of a Gumbel sample. d3 is never verified (it only
+# gates whether chunk B is verified), so this keeps the committed distribution exact and
+# raises P(bonus == d3) from sum_t p(t) q(t) to p(argmax q). Inert without probabilistic drafts.
+_SQ2_GREEDY_D3 = _os.environ.get("CMP_SQ_GREEDY_D3", "0") == "1"
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -56,7 +63,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if (
             _cmp_ps.ENABLED
             and self.num_speculative_steps == _cmp_ps.SUPPORTED_K
-            and self.draft_logits is None
         ):
             self.num_p2 = _cmp_ps.num_p2(self.num_speculative_steps)
             self.draft_tokens = torch.zeros(
@@ -65,6 +71,24 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 dtype=torch.int64,
                 device=device,
             )
+            if self.draft_logits is not None:
+                # recipe: probabilistic drafts. The chain
+                # writes gumbel_sample's logits cache at columns k..k+num_p2-1
+                # (current_draft_step = chain step), so the cache needs
+                # k + num_p2 columns. The rejection sampler reads columns
+                # 0..k-1; the model runner copies columns k+1..2k there before
+                # chunk B is verified. 8 x 5 x 154,880 x bf16 = 12.4 MB.
+                dtype, fill = self.draft_logits_spec(vllm_config)
+                self.draft_logits = torch.full(
+                    (
+                        self.max_num_reqs,
+                        self.num_speculative_steps + self.num_p2,
+                        self.vocab_size,
+                    ),
+                    fill,
+                    dtype=dtype,
+                    device=device,
+                )
         self.num_chain_steps = self.num_speculative_steps + self.num_p2
         self._chain_ctx: tuple | None = None
 
@@ -416,6 +440,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         num_reqs, batch_desc, num_tokens_across_dp, seq_lens_ub = self._chain_ctx
         self._chain_ctx = None
         k = self.num_speculative_steps
+        self._sq2_active = _SQ2_GREEDY_D3 and self.draft_logits is not None
+        if self._sq2_active:
+            # CMP_SQ_GREEDY_D3: the chain's step k is drawn at temperature 0 (argmax); the
+            # graph reads self.temperature, which the loop below rewrites eagerly
+            # between replays exactly as it does current_draft_step.
+            self._sq2_temp_saved = self.temperature.clone()
         self.on_multi_step_decode_begin(num_reqs)
         self._multi_step_decode(
             num_reqs,
@@ -425,6 +455,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             seq_lens_ub,
             steps=range(k, self.num_chain_steps),
         )
+        if getattr(self, "_sq2_active", False):
+            self.temperature.copy_(self._sq2_temp_saved)
+            self._sq2_active = False
         self.on_multi_step_decode_end(num_reqs)
         return self.draft_tokens[:num_reqs, k : self.num_chain_steps]
 
@@ -583,6 +616,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 )
 
             self.current_draft_step.fill_(step)
+            if getattr(self, "_sq2_active", False):
+                if step == self.num_speculative_steps:
+                    self.temperature.zero_()  # CMP_SQ_GREEDY_D3: d3 = argmax
+                elif step == self.num_speculative_steps + 1:
+                    self.temperature.copy_(self._sq2_temp_saved)
 
             if batch_desc.cg_mode == CUDAGraphMode.FULL:
                 assert self.decode_cudagraph_manager is not None
