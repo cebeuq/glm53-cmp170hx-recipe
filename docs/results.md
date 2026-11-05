@@ -103,7 +103,7 @@ with custom all-reduce ([comm](comm.md)).
 |---|---|
 | Hybrid checkpoint vs original NVFP4, teacher-forced top-1 agreement (PP8) | 96.4% (gate: >= 95%); NLL on fixed text within the +2% budget |
 | INT4-g128 experts + INT8 residue vs original NVFP4 (rejected) | 93.65% agreement: fail |
-| Hybrid, TP2 x PP4 vs NVFP4 goldens | 93.9% agreement (see the open question in [known limits](known-limits.md)) |
+| Hybrid, TP2 x PP4 vs NVFP4 goldens | 93.9% agreement, measured before the hand-off fix (see [known limits](known-limits.md#the-pipeline-hand-off-at-tp2-fixed)) |
 | GSM8K-250, hybrid PP8 / TP2 x PP4 / TP8 (no speculation) | 83.2% / 84.8% / 86.8% |
 | GSM8K-250, production stack at 350K | 84.8%, 82.8%, 87.6% |
 | Context ladder | 65K, 131K, 262K, 519K prompts answered coherently, no Xid |

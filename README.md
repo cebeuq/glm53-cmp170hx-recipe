@@ -146,9 +146,9 @@ private address. Other configurations, all measured: [`engine/variants/`](engine
 - PipeSpec helps only a lone request, and at long agentic contexts it may lower draft
   acceptance unless `CMP_PIPESPEC_REFILL=1` (not measured yet).
 - Fair chunked prefill (`CMP_FAIR_CHUNK`) is experimental and off by default.
-- An unverified finding from reading the fork's source: the TP2 pipeline hand-off may combine
-  per-GPU partial sums incorrectly at three layers. Details and how to test it:
-  [known limits](docs/known-limits.md#open-question-the-pipeline-hand-off-at-tp2-unverified).
+- The fork's TP2 pipeline hand-off combined per-GPU partial sums incorrectly at three layers;
+  `patches/vllm/ppfix_gpu_worker.py` fixes it. The TP2 x PP4 quality numbers were measured before the fix:
+  [known limits](docs/known-limits.md#the-pipeline-hand-off-at-tp2-fixed).
 - The patches are whole-file copies for one pinned image; port them with the diffs.
 - The checkpoint is abliterated; add whatever safeguards your use needs.
 
