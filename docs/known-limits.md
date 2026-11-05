@@ -28,26 +28,47 @@
 - **The checkpoint is abliterated** (its refusal behavior was removed by the checkpoint author);
   plan any safeguards your use needs at the application level.
 
-## Open question: the pipeline hand-off at TP2 (unverified)
+## The pipeline hand-off at TP2 (fixed)
 
-Found by reading the fork's source; **not yet confirmed or A/B tested.**
+This section used to be an open question found by reading the fork's source. It is confirmed
+and fixed by `patches/vllm/ppfix_gpu_worker.py`, which `engine/compose.yaml` mounts.
 
 In the fork's DeepSeek-V3.2 model (`models/deepseek_v32/nvidia/model.py`) the MoE layers run
 with `reduce_results=False` (around line 96): each tensor-parallel rank's MoE output is a
 partial sum, and the all-reduce is fused into the next layer's input norm. A non-last stage
 returns these un-reduced `hidden_states` together with the residual (around line 288). The GPU
-worker passes `all_gather_tensors = {}` to the pipeline send/receive
+worker passed `all_gather_tensors = {}` to the pipeline send/receive
 (`v1/worker/gpu_worker.py`, around line 1174), so `_should_use_all_gather`
-(`distributed/parallel_state.py`, around lines 1054-1066) returns true: each TP rank sends only
-its own slice of the tensor (around line 1208) and the receiving stage all-gathers the slices.
+(`distributed/parallel_state.py`, around lines 1054-1066) returned true: each TP rank sent only
+its own slice of the tensor (around line 1208) and the receiving stage all-gathered the slices.
 For the residual, which is identical on both ranks, that is correct. For the partial sums it
-would reassemble [rank 0's first half; rank 1's second half], and the next layer's all-reduce
-would then produce 2 x that instead of rank 0 + rank 1. This would affect the MoE output of the
-last layer of each of the first three stages (layers 21, 41 and 61 with the 22,20,20,16 split).
+reassembled [rank 0's first half; rank 1's second half], and the next layer's all-reduce then
+produced 2 x that instead of rank 0 + rank 1. This affected the MoE output of the last layer of
+each of the first three stages (layers 21, 41 and 61 with the 22,20,20,16 split).
 
-What fits this reading: on the same weights, TP2 x PP4 showed lower teacher-forced top-1
-agreement (93.9%) than PP8 (96.4%), which we had attributed to all-reduce rounding. What does
-not obviously fit: GSM8K-250 on TP2 x PP4 (84.8%) was not lower than PP8 (83.2%), and outputs
-are coherent. A fix would be about ten lines (send full tensors at the PP boundary, or reduce
-before sending); the test is NLL on fixed text and teacher-forced agreement against PP8,
-plus GSM8K. If you run this stack and can check it, please open an issue.
+The fix is two lines: `"hidden_states": False` in both places where the worker builds
+`all_gather_tensors`, so every rank sends its whole `hidden_states` to its peer on the next
+stage and the residual keeps its existing rule. At TP1 the tensor is whole either way.
+
+Measured 2026-11-04 on a second 8x CMP 170HX server (a contributed measurement, not the machine
+in [hardware](hardware.md)): the production stack (TP2 x PP4, P2P, int8 KV, MTP k=2 + PipeSpec,
+524K context) plus a grammar bitmask fix for drafts that was on in both runs (proposed separately),
+same build and weights, with the original and with the patched `gpu_worker.py`.
+The gate is `bench/quality_gate.py compare` against goldens captured from the same checkpoint
+at TP8, where there is no pipeline and so no hand-off.
+
+| | original | patched |
+|---|---:|---:|
+| Teacher-forced top-1 agreement | 86.98% | 90.13% |
+| NLL on the fixed text, against the goldens | +0.38% | -0.65% |
+| Log-prob difference per token, mean / p99 | 0.164 / 1.92 | 0.055 / 0.71 |
+| Accepted MTP drafts per 2-draft chunk (temperature 0) | 1.21 | 1.30 |
+| One stream, JSON / code / prose prompt, tok/s | 83.3 / 94.9 / 57.8 | 94.7 / 93.1 / 60.7 |
+
+Those goldens are not the NVFP4 goldens behind the 93.9% and 96.4% in [results](results.md), so
+read the difference (+3.2 points), not the level. No speed change can be resolved: code and prose
+are equal within this engine's run-to-run spread, and the JSON prompt's 83.3 sits just under the
+85.6 to 94.7 tok/s that reloads of the patched build gave with identical math. Draft acceptance is
+lower with the original file (1.21 against 1.25 to 1.31 across patched reloads), which fits
+corrupted hidden states also hurting the drafter. Not re-measured: the 93.9% row of the quality
+table and GSM8K on the machine in [hardware](hardware.md); both predate the fix.

@@ -1,0 +1,24 @@
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1171,7 +1171,12 @@
+         intermediate_tensors = None
+         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+-        all_gather_tensors = {}
++        # recipe patch (2026-10-27): this fork returns the UN-REDUCED MoE/MLP output as the stage
++        # hidden_states (the TP all-reduce is fused into the next layer norm). The TP-sliced
++        # send + all-gather would reassemble [rank0 half ; rank1 half] of two different partial
++        # sums, which the next layer then all-reduces (doubles). Send hidden_states whole, rank
++        # to rank; the residual is replicated and may still be gathered.
++        all_gather_tensors = {"hidden_states": False}
+         compilation_config = self.vllm_config.compilation_config
+         parallel_config = self.vllm_config.parallel_config
+ 
+@@ -1199,6 +1204,7 @@
+                 )
+             )
+             all_gather_tensors = {
++                "hidden_states": False,  # recipe patch, see above
+                 "residual": not is_residual_scattered_for_sp(
+                     self.vllm_config, batch_desc.num_tokens
+                 )

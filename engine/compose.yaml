@@ -40,6 +40,7 @@ services:
       - ../patches/vllm/indexer.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py:ro
       - ../patches/vllm/vocab_parallel_embedding.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/vocab_parallel_embedding.py:ro
       - ../patches/vllm/v32_mtp.py:/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v32/nvidia/mtp.py:ro
+      - ../patches/vllm/ppfix_gpu_worker.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py:ro
     ports: [ "127.0.0.1:${PORT:-8000}:8000" ]
     networks: [ glm53 ]
     deploy:

@@ -26,6 +26,7 @@ SPDX header.
 | `xpu_mla_sparse.py` | `v1/attention/backends/mla/xpu_mla_sparse.py` | `TRITON_MLA_SPARSE` backend: accepts `fp8`/`fp8_ds_mla` KV and routes it to the read path above; metadata fix for the current fork | always | yes |
 | `mqa_logits_triton.py` | `v1/attention/ops/mqa_logits_triton.py` | indexer logits: clamp the width captured into a FULL CUDA graph (an uncapped capture caused Xid 31) | always | yes |
 | `v32_mtp.py` | `models/deepseek_v32/nvidia/mtp.py` | **MTP drafter embedding fix under pipeline parallelism** (see [docs/mtp.md](../docs/mtp.md)) | always | yes |
+| `ppfix_gpu_worker.py` | `v1/worker/gpu_worker.py` | **pipeline hand-off fix for TP > 1**: a stage's un-reduced `hidden_states` go whole from each rank to its peer instead of being TP-sliced and all-gathered (see [docs/known-limits.md](../docs/known-limits.md#the-pipeline-hand-off-at-tp2-fixed)) | always | yes |
 | `p2p_custom_all_reduce.py` | `distributed/device_communicators/custom_all_reduce.py` | lets vLLM's custom all-reduce run for TP > 2 over PCIe P2P | `CMP_PCIE_CUSTOM_AR=1` | yes (`compose.p2p.yaml`) |
 | `pipespec_core.py` | `v1/cmp_pipespec.py` (new) | PipeSpec policy, flags and counters | `CMP_PIPESPEC=1` | yes |
 | `pipespec_scheduler.py` | `v1/core/sched/scheduler.py` | `scheduler.py` below + PipeSpec chunk-A/B scheduling and dropped-chunk rollback | `CMP_PIPESPEC=1` | yes (`compose.pipespec.yaml`) |
