@@ -37,6 +37,13 @@ SPDX header.
 | `config_vllm.py` | `config/vllm.py` | optional cap on concurrent PP batches | `CMP_MAX_CONCURRENT_BATCHES=N` | mounted, off |
 | `indexer.py` | `v1/attention/backends/mla/indexer.py` | indexer prefill buffer `max_model_len x 40` made configurable; 4 frees ~2.3 GiB per GPU at 512K | `CMP_INDEXER_PREFILL_BUF_FACTOR` | yes (4) |
 | `vocab_parallel_embedding.py` | `model_executor/layers/vocab_parallel_embedding.py` | Triton GEMV for `lm_head` at batch <= 16 (faster at TP1, no gain at TP2) | `CMP_LMHEAD_TRITON=1` | mounted, off |
+| `grammar_sched_output.py` | `v1/core/sched/output.py` | `GrammarOutput.num_acceptable_drafts`: how many leading drafts of a request the grammar bitmask really constrained (see [docs/structured-output.md](../docs/structured-output.md)) | always | yes (`compose.grammar.yaml`) |
+| `grammar_scheduler.py` | `v1/core/sched/scheduler.py` | `pipespec_scheduler.py` + the scheduler fills `num_acceptable_drafts` with the non-placeholder drafts it scheduled | always | yes (`compose.grammar.yaml`) |
+| `grammar_structured_output_init.py` | `v1/structured_output/__init__.py` | bitmask fill: a draft the grammar rejects is logged and the last valid row reused, instead of an `AssertionError` in the engine core | always | yes (`compose.grammar.yaml`) |
+| `grammar_gpu_structured_outputs.py` | `v1/worker/gpu/structured_outputs.py` | `grammar_invalid_drafts`: mask of the drafts that met a permissive bitmask row | always | yes (`compose.grammar.yaml`) |
+| `grammar_batch_shard.py` | `v1/worker/gpu/sample/batch_shard.py` | carries `num_acceptable_drafts` through batch sharding | always | yes (`compose.grammar.yaml`) |
+| `grammar_rejection_sampler.py` | `v1/worker/gpu/spec_decode/rejection_sampler.py` | verifies a copy of the drafts with the invalid ones set to -1, so acceptance stops before an unconstrained row | always | yes (`compose.grammar.yaml`) |
+| `grammar_model_runner.py` | `v1/worker/gpu/model_runner.py` | `pipespec_model_runner.py` + passes the invalid-draft mask to the sampler | always | yes (`compose.grammar.yaml`) |
 
 ## Porting to another image
 

@@ -130,6 +130,7 @@ private address. Other configurations, all measured: [`engine/variants/`](engine
 - [Results](docs/results.md): all measurements, progression, layouts, quality, power
 - [MTP](docs/mtp.md): the PP embedding bug, choosing k, drafter experiments
 - [PipeSpec](docs/pipespec.md): pipelined speculation across pipeline stages
+- [Structured output](docs/structured-output.md): json_schema and tool_choice together with speculative decoding
 - [KV cache](docs/kv-cache.md): int8-tile latent KV on Ampere
 - [P2P](docs/p2p.md): the TRAP31 driver build, install, rollback, tests
 - [All-reduce](docs/comm.md) and [kernels](docs/kernels.md): microbenchmarks

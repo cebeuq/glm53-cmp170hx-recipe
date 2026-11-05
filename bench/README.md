@@ -12,6 +12,7 @@ model id (default `glm-5.3`). Protocols and caveats: [docs/methodology.md](../do
 | `conc_gate.py BASE` | corruption under concurrent requests |
 | `ctx_crash_ladder.py BASE RUNG...` | nested long prompts up to the context limit |
 | `multiagent_stall.py BASE OUT` | decode stalls while a long prompt prefills |
+| `struct_probe.py BASE MODEL CONC ROUNDS TAG` | structured output (json_schema, named tool_choice, json_object) with speculative decoding: 5xx and schema validity |
 | `streamlib.py` | shared SSE timing helpers |
 
 `accept_prompts.jsonl`: 16 coding prompts written for this benchmark, 16 web-browsing agent
